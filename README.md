@@ -32,8 +32,13 @@ A hybrid pipeline:
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev]"           # core + tests
+pip install -e ".[local]"         # + local engine (OpenCV/numpy) — needed for --engine local
 ```
+
+> After every `git pull`, re-run `pip install -e ".[local]"` — it's a no-op when
+> nothing changed and picks up any newly added dependencies (otherwise you may
+> hit `ModuleNotFoundError`).
 
 ## Usage
 

@@ -239,7 +239,16 @@ def _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
     """Local engine: detect callouts with OpenCV, identify with the free ensemble."""
     from .brickognize import BrickognizeClient
     from .inventory import load_inventory_file
-    from .locate import locate_local, make_identifier
+
+    # The local engine pulls in the optional [local] deps (numpy via colors,
+    # OpenCV via vision_local). Turn a missing-dependency crash into a clear hint.
+    try:
+        from .locate import locate_local, make_identifier
+    except ImportError as exc:
+        raise click.UsageError(
+            f"The local engine needs the optional dependencies ({exc.name} is missing). "
+            'Install them with:  pip install -e ".[local]"'
+        )
 
     if not set_num:
         from .pdf_render import detect_set_number
