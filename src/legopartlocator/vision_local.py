@@ -65,6 +65,28 @@ class DetectConfig:
     panel_gray_low: int = 200
     panel_gray_high: int = 240
 
+    # Alternate panel detector: find the panel by its dark border/outline
+    # stroke rather than its fill colour. On a booklet whose page background
+    # is itself pale/tinted (not plain white), the panel's fill can sit in the
+    # same grayscale band as the surrounding page -- they merge into one giant
+    # region and no panel is ever isolated. A real panel is still a rounded
+    # rectangle enclosed by a dark stroke though, so it shows up as a "hole"
+    # in a dark-ink mask regardless of what shade its interior/background are.
+    # Found on a real booklet (76307) with a pale-blue page background where
+    # the plain fill-colour approach detected zero real panels across the
+    # whole book. Both detectors run and their boxes are merged/deduped, so
+    # plain-white-background booklets (where the fill-colour approach already
+    # works) are unaffected.
+    cell_border_dark_max: int = 120
+
+    # A genuine panel is a (rounded) rectangle, so its contour fills almost
+    # all of its own bounding box. Small enclosed loops elsewhere in the
+    # illustration (gaps between studs, eyes, any closed line-art shape) also
+    # show up as "holes" in the dark-ink mask but are irregular, filling far
+    # less of their bbox. Measured ~0.98 for real panels vs. ~0.53-0.55 for
+    # illustration noise on a real page.
+    cell_border_min_extent: float = 0.85
+
     # Callout-cell size gate, as a fraction of total page area.
     min_cell_area: float = 0.0005
     max_cell_area: float = 0.2
@@ -305,18 +327,14 @@ class LocalDetector:
             return cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
         return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    def _cell_boxes(self, gray: np.ndarray) -> List[Tuple[int, int, int, int]]:
-        """Bounding boxes of the light-gray callout panels, in reading order."""
+    def _size_and_shape_gate(
+        self, boxes: List[Tuple[int, int, int, int]], page_area: float
+    ) -> List[Tuple[int, int, int, int]]:
         cfg = self.config
-        height, width = gray.shape[:2]
-        page_area = float(height * width)
         min_area = cfg.min_cell_area * page_area
         max_area = cfg.max_cell_area * page_area
-
-        mask = cv2.inRange(gray, cfg.panel_gray_low, cfg.panel_gray_high)
-        boxes: List[Tuple[int, int, int, int]] = []
-        for contour in _find_contours(mask):
-            x, y, w, h = cv2.boundingRect(contour)
+        kept = []
+        for x, y, w, h in boxes:
             if h == 0:
                 continue
             area = float(w * h)
@@ -325,10 +343,57 @@ class LocalDetector:
             aspect = w / h
             if aspect < cfg.min_aspect or aspect > cfg.max_aspect:
                 continue
+            kept.append((x, y, w, h))
+        return kept
+
+    def _cell_boxes_by_fill(self, gray: np.ndarray) -> List[Tuple[int, int, int, int]]:
+        """Panels found by their light-gray fill colour (the classic style:
+        a plain white page with a distinctly gray panel)."""
+        cfg = self.config
+        mask = cv2.inRange(gray, cfg.panel_gray_low, cfg.panel_gray_high)
+        boxes = [cv2.boundingRect(c) for c in _find_contours(mask)]
+        return self._size_and_shape_gate(boxes, float(gray.shape[0] * gray.shape[1]))
+
+    def _cell_boxes_by_border(self, gray: np.ndarray) -> List[Tuple[int, int, int, int]]:
+        """Panels found as a "hole" enclosed by a dark border stroke.
+
+        Robust to a page background that shares the panel's fill tone (fill
+        colour alone can't separate the two then); relies only on the border
+        being darker than the panel/background, which holds regardless of
+        what shade either of them is.
+        """
+        cfg = self.config
+        ink_mask = cv2.inRange(gray, 0, cfg.cell_border_dark_max)
+        contours, hierarchy = cv2.findContours(ink_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        if hierarchy is None:
+            return []
+        boxes = []
+        for i, c in enumerate(contours):
+            if hierarchy[0][i][3] == -1:  # only holes (enclosed by a dark parent)
+                continue
+            x, y, w, h = cv2.boundingRect(c)
+            bbox_area = w * h
+            extent = (cv2.contourArea(c) / bbox_area) if bbox_area > 0 else 0.0
+            if extent < cfg.cell_border_min_extent:
+                continue
             boxes.append((x, y, w, h))
+        return self._size_and_shape_gate(boxes, float(gray.shape[0] * gray.shape[1]))
+
+    def _cell_boxes(self, gray: np.ndarray) -> List[Tuple[int, int, int, int]]:
+        """Bounding boxes of callout panels, in reading order.
+
+        Merges two independent detectors (fill-colour and border-enclosure;
+        see each for why both are needed) and dedupes boxes that clearly
+        refer to the same panel.
+        """
+        boxes = self._cell_boxes_by_fill(gray) + self._cell_boxes_by_border(gray)
+        deduped: List[Tuple[int, int, int, int]] = []
+        for box in boxes:
+            if not any(_bbox_overlap_fraction(box, other) > 0.6 for other in deduped):
+                deduped.append(box)
         # Deterministic reading order: top-to-bottom, then left-to-right.
-        boxes.sort(key=lambda b: (b[1], b[0]))
-        return boxes
+        deduped.sort(key=lambda b: (b[1], b[0]))
+        return deduped
 
     def _detect_callouts(
         self, img: np.ndarray, cell_boxes: List[Tuple[int, int, int, int]]

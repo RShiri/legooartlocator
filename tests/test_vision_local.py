@@ -133,6 +133,34 @@ def test_unreadable_ocr_defaults_quantity_to_one():
     assert len(result.callouts) == 2
 
 
+def test_panel_detected_via_border_when_fill_matches_background():
+    """Regression: on a page whose background is the same tone as a panel's
+    own fill (e.g. 76307's pale-blue booklet), the plain fill-colour detector
+    can't isolate the panel -- its interior and the page background merge
+    into one giant region and no panel is ever found. A dark border stroke
+    around the panel still lets it be found as an enclosed "hole"."""
+    page = np.full((PAGE_H, PAGE_W, 3), 220, dtype=np.uint8)  # bg == panel fill tone
+    x, y, w, h = 300, 300, 200, 100
+    cv2.rectangle(page, (x, y), (x + w, y + h), BLACK, thickness=3)  # border only
+
+    result = LocalDetector(ocr=FakeOCR()).detect_page(page, page_index=9)
+    assert len(result.callouts) == 1
+    bx, by, _, _ = result.callouts[0].bbox
+    assert 295 <= bx <= 305 and 295 <= by <= 305
+
+
+def test_small_irregular_ink_loop_is_not_a_callout_cell():
+    """A small closed dark loop elsewhere in the illustration (e.g. a gap
+    between studs, an icon's ring) is also a "hole" in the ink mask, but is
+    far less rectangular than a real panel -- filtered by contour extent
+    (contour area / bbox area), not just size/aspect."""
+    page = _blank_page()
+    cv2.circle(page, (400, 400), 30, BLACK, thickness=4)  # ring -> circular hole
+
+    result = LocalDetector(ocr=FakeOCR()).detect_page(page, page_index=9)
+    assert len(result.callouts) == 0
+
+
 # --- projection + BOM classification -----------------------------------------
 
 def test_to_page_extract_matches_and_flags_bom():
