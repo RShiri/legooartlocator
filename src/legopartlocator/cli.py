@@ -59,6 +59,12 @@ def main() -> None:
 @click.option("--triage-dpi", type=int, default=110, show_default=True, help="Render DPI for the cheap triage pass.")
 @click.option("--single-pass", is_flag=True, help="Disable two-pass; run the detailed model on every page.")
 @click.option("--no-rebrickable", is_flag=True, help="Skip Rebrickable reconciliation (vision-only).")
+@click.option("--engine", type=click.Choice(["claude", "local"]), default="claude", show_default=True,
+              help="Extraction+ID engine: 'claude' (vision API) or 'local' (OpenCV + Brickognize/embeddings, no paid API).")
+@click.option("--inventory-file", type=click.Path(exists=True, dir_okay=False), default=None,
+              help="Local set inventory CSV/JSON (BrickLink/Rebrickable export). Enables the local engine with no key.")
+@click.option("--no-brickognize", is_flag=True, help="[local engine] Disable the Brickognize signal.")
+@click.option("--embeddings", is_flag=True, help="[local engine] Enable embedding retrieval (needs the [ml] extra + network).")
 @click.option("--extracts", type=click.Path(exists=True, dir_okay=False), default=None,
               help="Load pre-extracted page JSON instead of running the vision pass.")
 @click.option("--out", "out_dir", default="out", show_default=True, help="Output directory.")
@@ -73,6 +79,10 @@ def scan(
     triage_dpi: int,
     single_pass: bool,
     no_rebrickable: bool,
+    engine: str,
+    inventory_file: Optional[str],
+    no_brickognize: bool,
+    embeddings: bool,
     extracts: Optional[str],
     out_dir: str,
     cache_dir: str,
@@ -80,6 +90,14 @@ def scan(
 ) -> None:
     """Scan a LEGO instruction PDF and write result.json / result.csv."""
     _load_dotenv()
+
+    # Local engine: OpenCV detection + Brickognize/embedding identification (no paid API).
+    if engine == "local":
+        if not pdf:
+            raise click.UsageError("--engine local requires a PDF path.")
+        _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
+                   no_brickognize, embeddings, no_rebrickable, out_dir)
+        return
 
     if not pdf and not extracts:
         raise click.UsageError("Provide a PDF path, or --extracts for offline mode.")
@@ -175,6 +193,97 @@ def _render_and_extract(pdf, page_spec, max_pages, dpi, triage_dpi, single_pass,
         f"skipped {stats['skipped']} (no callouts)."
     )
     return page_extracts, total
+
+
+def _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
+               no_brickognize, embeddings, no_rebrickable, out_dir):
+    """Local engine: detect callouts with OpenCV, identify with the free ensemble."""
+    from .brickognize import BrickognizeClient
+    from .inventory import load_inventory_file
+    from .locate import locate_local, make_identifier
+
+    if not set_num:
+        from .pdf_render import detect_set_number
+
+        set_num = detect_set_number(pdf)
+        if set_num:
+            click.echo(f"Auto-detected set number: {set_num}")
+
+    # The identifiers are constrained to the inventory, so we must have one.
+    inventory = None
+    set_name = None
+    if inventory_file:
+        inventory = load_inventory_file(inventory_file)
+        click.echo(f"Loaded {len(inventory)} inventory lines from {inventory_file}.")
+    elif set_num and not no_rebrickable:
+        inventory, set_name = _fetch_inventory(set_num)
+    if not inventory:
+        raise click.UsageError(
+            "The local engine needs the set inventory to constrain identification. "
+            "Provide --inventory-file PATH (a free BrickLink/Rebrickable export), or "
+            "--set NNNN with REBRICKABLE_API_KEY set."
+        )
+
+    brickognize = None if no_brickognize else BrickognizeClient()
+
+    gallery = backend = None
+    if embeddings:
+        try:
+            from .embedding import ClipBackend, build_gallery, download_reference_images
+
+            click.echo("Building embedding gallery (downloading reference images)...")
+            backend = ClipBackend()
+            ref_images = download_reference_images(inventory)
+            gallery = build_gallery(inventory, ref_images, backend)
+            click.echo(f"Gallery: {len(gallery)} parts embedded.")
+        except Exception as exc:  # torch/network/etc. — degrade gracefully
+            click.echo(f"Embeddings disabled ({exc}).", err=True)
+            gallery = backend = None
+
+    identifier = make_identifier(
+        inventory, brickognize=brickognize, gallery=gallery, backend=backend, use_color=True
+    )
+
+    # OCR (quantities + bag numerals) needs the Tesseract binary; degrade if absent.
+    import shutil
+
+    from .vision_local import LocalDetector
+
+    detector = None
+    if shutil.which("tesseract") is None:
+        click.echo(
+            "Tesseract binary not found: quantities default to 1 and bag numbers "
+            "won't be read. Install Tesseract for full local accuracy.",
+            err=True,
+        )
+
+        class _NullOCR:
+            def read_text(self, image_bgr):
+                return ""
+
+        detector = LocalDetector(ocr=_NullOCR())
+
+    signals = ["colour"]
+    if brickognize:
+        signals.insert(0, "brickognize")
+    if gallery:
+        signals.append("embedding")
+    click.echo(f"Local engine: detecting + identifying at {dpi} DPI (signals: {', '.join(signals)})...")
+
+    def progress(done, tot):
+        click.echo(f"  page {done}/{tot}   \r", nl=False)
+
+    result = locate_local(
+        pdf, inventory, identifier, dpi=dpi, page_spec=page_spec, max_pages=max_pages,
+        detector=detector, use_color=True, set_num=set_num, set_name=set_name, progress=progress,
+    )
+    click.echo("")
+    paths = write_outputs(result, out_dir)
+    click.echo(f"\nParts located: {len(result.parts)}")
+    if result.warnings:
+        click.echo(f"Warnings: {len(result.warnings)} (see result.json)")
+    click.echo(f"Wrote {paths['json']} and {paths['csv']}.")
+    click.echo("Open web/index.html and load result.json to search.")
 
 
 def _fetch_inventory(set_num: str):

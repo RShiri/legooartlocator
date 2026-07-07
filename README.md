@@ -50,6 +50,11 @@ lpl scan instructions.pdf --pages 1-40 --max-pages 20 --dpi 120
 # Two-pass is on by default; tune it or turn it off
 lpl scan instructions.pdf --triage-dpi 110 --dpi 180   # default two-pass
 lpl scan instructions.pdf --single-pass                # detailed model on every page
+
+# Fully local engine — no paid API (OpenCV detect + Brickognize/embedding ID)
+lpl scan instructions.pdf --engine local --set 76307              # inventory via Rebrickable key
+lpl scan instructions.pdf --engine local --inventory-file inv.csv # inventory from a free export, no key
+lpl scan instructions.pdf --engine local --inventory-file inv.csv --embeddings  # add local image matching
 ```
 
 Then open `web/index.html` and drop in `out/result.json` (or serve the folder
@@ -109,10 +114,26 @@ torch + open_clip). The blending, nearest-neighbour math, inventory loading, and
 API parsing are all unit-tested offline; the live Brickognize HTTP call and the
 torch encoder are injected so they're swappable.
 
-> **Status:** the identification subsystem is built and tested. The remaining
-> glue to run it fully on a PDF is (a) OpenCV callout-crop detection (needs
-> tuning against real instruction pages) and (b) wiring the identifier into the
-> reconcile step. Those are the next step once we've seen a real page.
+This is wired end-to-end as the **`--engine local`** path:
+
+```
+PDF -> vision_local (OpenCV: callout crops + bag numerals + quantity OCR)
+    -> locate.assemble_result (identify each crop, constrained to inventory)
+    -> result.json / result.csv
+```
+
+Run it with `lpl scan instructions.pdf --engine local --inventory-file inv.csv`
+(see Usage). It needs the `[local]` extra (`pip install -e ".[local]"`) and the
+**Tesseract binary** for reading quantities/bag numbers — without Tesseract it
+still runs but quantities default to 1 and bag numbers aren't read. `--embeddings`
+additionally turns on the image-matcher (needs the `[ml]` extra + network to
+fetch reference images).
+
+> **Status:** fully wired and unit-tested (blending, NN, inventory, detection
+> mechanics, and the `assemble_result` orchestrator). The one thing that still
+> needs a real instruction page is **tuning the OpenCV `DetectConfig`
+> thresholds** (gray band, cell-area gates) — they're calibrated to the standard
+> callout style but real DPI/print variation will want adjustment.
 
 ## Development
 
