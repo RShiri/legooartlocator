@@ -55,6 +55,15 @@ lpl scan instructions.pdf --single-pass                # detailed model on every
 Then open `web/index.html` and drop in `out/result.json` (or serve the folder
 and it auto-loads a sibling `result.json`).
 
+**Windows shortcut:** a `run.bat` wrapper is included so you can skip the long
+venv path — from the repo folder just type:
+
+```bat
+run scan 76307.pdf --set 76307 --out out
+```
+
+(equivalent to `.venv\Scripts\python.exe -m legopartlocator.cli scan ...`).
+
 Keys are read from the environment or a `.env` file (see `.env.example`):
 `ANTHROPIC_API_KEY`, and optionally `REBRICKABLE_API_KEY`
 (free key at <https://rebrickable.com/api/>).
