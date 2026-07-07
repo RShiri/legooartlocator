@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Protocol, Tuple, Union, runtime_checkable
+from typing import List, Optional, Protocol, Sequence, Tuple, Union, runtime_checkable
 
 import cv2
 import numpy as np
@@ -34,6 +34,18 @@ ImageInput = Union[bytes, bytearray, memoryview, np.ndarray]
 
 # Leading integer before an 'x'/'X' in a callout label, e.g. "2x", "12 X".
 _QTY_RE = re.compile(r"(\d+)\s*[xX]")
+
+# -- bag-marker glyph merging / rejection tunables (fixed, not per-config) ----
+# Two glyph bboxes merge into one multi-digit numeral candidate when the
+# horizontal gap between them is small relative to their height, their
+# heights are close (same font size), and they overlap vertically (same row).
+_MERGE_GAP_FRAC = 0.6          # max horizontal gap, as a fraction of glyph height
+_MERGE_HEIGHT_TOL_FRAC = 0.4   # max relative height difference
+_MERGE_MIN_VOVERLAP_FRAC = 0.5  # min vertical overlap, as a fraction of the shorter glyph
+# A candidate whose bbox mostly sits inside a callout cell (dark part-render ink,
+# not a bag numeral) is rejected once its overlap with any cell exceeds this
+# fraction of the candidate's own area.
+_CANDIDATE_CELL_OVERLAP_MAX = 0.3
 
 
 @dataclass
@@ -141,6 +153,50 @@ def _parse_pure_int(text: str) -> Optional[int]:
     return None
 
 
+def _should_merge_glyphs(
+    a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]
+) -> bool:
+    """True if two dark-glyph bboxes look like adjacent digits of one numeral.
+
+    Requires: a small horizontal gap relative to glyph height (so digits of the
+    same numeral, not unrelated ink elsewhere on the page), similar heights
+    (same font size), and substantial vertical overlap (same text row).
+    """
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    a_right, b_right = ax + aw, bx + bw
+    gap = max(bx - a_right, ax - b_right, 0)
+    max_h = max(ah, bh)
+    if max_h <= 0 or gap >= _MERGE_GAP_FRAC * max_h:
+        return False
+
+    min_h, hi_h = min(ah, bh), max(ah, bh)
+    if hi_h <= 0 or (hi_h - min_h) / hi_h > _MERGE_HEIGHT_TOL_FRAC:
+        return False
+
+    top, bottom = max(ay, by), min(ay + ah, by + bh)
+    overlap = max(bottom - top, 0)
+    if overlap < _MERGE_MIN_VOVERLAP_FRAC * min_h:
+        return False
+
+    return True
+
+
+def _bbox_overlap_fraction(
+    candidate: Tuple[int, int, int, int], other: Tuple[int, int, int, int]
+) -> float:
+    """Fraction of ``candidate``'s area covered by its intersection with ``other``."""
+    cx, cy, cw, ch = candidate
+    area = cw * ch
+    if area <= 0:
+        return 0.0
+    ox, oy, ow, oh = other
+    ix1, iy1 = max(cx, ox), max(cy, oy)
+    ix2, iy2 = min(cx + cw, ox + ow), min(cy + ch, oy + oh)
+    inter = max(ix2 - ix1, 0) * max(iy2 - iy1, 0)
+    return inter / area
+
+
 class LocalDetector:
     """Detects callout cells, quantities, and the bag numeral on one page image."""
 
@@ -161,9 +217,12 @@ class LocalDetector:
             return PageDetection(page_index=page_index)
 
         gray = self._to_gray(img)
-        callouts = self._detect_callouts(gray, img)
+        cell_boxes = self._cell_boxes(gray)
+        callouts = self._detect_callouts(img, cell_boxes)
         is_parts_list = len(callouts) >= self.config.bom_cell_count
-        bag_marker = self._detect_bag_marker(gray, img)
+        bag_marker, bag_marker_candidate, bag_marker_bbox = self._detect_bag_marker(
+            gray, img, cell_boxes
+        )
 
         return PageDetection(
             page_index=page_index,
@@ -171,6 +230,8 @@ class LocalDetector:
             is_parts_list=is_parts_list,
             printed_page_number=None,
             callouts=callouts,
+            bag_marker_candidate=bag_marker_candidate,
+            bag_marker_bbox=bag_marker_bbox,
         )
 
     # -- internals --------------------------------------------------------
@@ -218,9 +279,11 @@ class LocalDetector:
         boxes.sort(key=lambda b: (b[1], b[0]))
         return boxes
 
-    def _detect_callouts(self, gray: np.ndarray, img: np.ndarray) -> List[DetectedCallout]:
+    def _detect_callouts(
+        self, img: np.ndarray, cell_boxes: List[Tuple[int, int, int, int]]
+    ) -> List[DetectedCallout]:
         callouts: List[DetectedCallout] = []
-        for (x, y, w, h) in self._cell_boxes(gray):
+        for (x, y, w, h) in cell_boxes:
             crop = img[y : y + h, x : x + w]
             ok, buf = cv2.imencode(".png", crop)
             crop_png = buf.tobytes() if ok else b""
@@ -233,30 +296,111 @@ class LocalDetector:
             )
         return callouts
 
-    def _detect_bag_marker(self, gray: np.ndarray, img: np.ndarray) -> Optional[int]:
-        """Return the bag number from a tall standalone numeral, else ``None``.
+    def _find_bag_marker_candidates(
+        self, gray: np.ndarray
+    ) -> List[Tuple[int, int, int, int]]:
+        """Find candidate bag-numeral bboxes, merging adjacent multi-digit glyphs.
 
-        Finds near-black ink blobs whose height reaches
-        ``bag_marker_min_height_frac`` of the page, OCRs each, and returns the
-        tallest one that reads as a bare integer.
+        A bag-start numeral is a tall, near-black glyph (or run of glyphs, for
+        numbers >= 10) standing alone on the page. This finds every near-black
+        connected component whose bbox height reaches
+        ``bag_marker_min_height_frac`` of the page height, then merges
+        components that are horizontally adjacent, similarly tall, and
+        vertically overlapping (see :func:`_should_merge_glyphs`) so a
+        multi-digit number like "12" -- which OCRs and contours as two separate
+        components, "1" and "2" -- collapses into a single bbox before OCR is
+        ever invoked. Returns merged bboxes sorted by area, largest first.
         """
         cfg = self.config
         height = gray.shape[0]
         min_h = cfg.bag_marker_min_height_frac * height
 
         mask = cv2.inRange(gray, 0, cfg.bag_marker_dark_max)
-        best_height = -1
-        best_value: Optional[int] = None
+        boxes: List[Tuple[int, int, int, int]] = []
         for contour in _find_contours(mask):
             x, y, w, h = cv2.boundingRect(contour)
             if h < min_h:
                 continue
+            boxes.append((x, y, w, h))
+        if not boxes:
+            return []
+
+        n = len(boxes)
+        parent = list(range(n))
+
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(i: int, j: int) -> None:
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[ri] = rj
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                if _should_merge_glyphs(boxes[i], boxes[j]):
+                    union(i, j)
+
+        groups: dict = {}
+        for i, box in enumerate(boxes):
+            groups.setdefault(find(i), []).append(box)
+
+        merged: List[Tuple[int, int, int, int]] = []
+        for group in groups.values():
+            x0 = min(b[0] for b in group)
+            y0 = min(b[1] for b in group)
+            x1 = max(b[0] + b[2] for b in group)
+            y1 = max(b[1] + b[3] for b in group)
+            merged.append((x0, y0, x1 - x0, y1 - y0))
+
+        merged.sort(key=lambda b: b[2] * b[3], reverse=True)
+        return merged
+
+    def _detect_bag_marker(
+        self,
+        gray: np.ndarray,
+        img: np.ndarray,
+        cell_boxes: List[Tuple[int, int, int, int]],
+    ) -> Tuple[Optional[int], bool, Optional[Tuple[int, int, int, int]]]:
+        """Return ``(bag_marker, bag_marker_candidate, bag_marker_bbox)``.
+
+        Gets merged candidate bboxes from :meth:`_find_bag_marker_candidates`
+        (multi-digit numerals already collapsed to one bbox each), drops any
+        that mostly overlap a detected callout cell -- dark ink rendered inside
+        a gray parts-callout panel is not a bag numeral -- then OCRs the
+        remaining candidates, largest first, and returns the first bare-integer
+        read.
+
+        If no candidate OCRs as a bare integer (this is the expected outcome
+        with no Tesseract binary installed: the OCR backend returns ``""`` for
+        every crop), ``bag_marker`` stays ``None`` but the single largest
+        plausible candidate is still reported via ``bag_marker_candidate`` and
+        ``bag_marker_bbox`` so a caller can assign the number structurally
+        (see :func:`assign_ordinal_bag_numbers`) instead of losing it.
+        """
+        candidates = self._find_bag_marker_candidates(gray)
+        plausible = [
+            c
+            for c in candidates
+            if not any(
+                _bbox_overlap_fraction(c, cell) > _CANDIDATE_CELL_OVERLAP_MAX
+                for cell in cell_boxes
+            )
+        ]
+        if not plausible:
+            return None, False, None
+
+        for bbox in plausible:
+            x, y, w, h = bbox
             crop = img[y : y + h, x : x + w]
             value = _parse_pure_int(self.ocr.read_text(crop))
-            if value is not None and h > best_height:
-                best_height = h
-                best_value = value
-        return best_value
+            if value is not None:
+                return value, False, bbox
+
+        return None, True, plausible[0]
 
 
 def detect_page(
@@ -268,3 +412,53 @@ def detect_page(
     """Convenience wrapper: detect one page with a one-off :class:`LocalDetector`."""
     detector = LocalDetector(config=config or DetectConfig(), ocr=ocr)
     return detector.detect_page(image, page_index)
+
+
+def assign_ordinal_bag_numbers(detections: Sequence[PageDetection]) -> List[str]:
+    """Fill in unread bag numbers structurally, assuming bags are numbered 1..N.
+
+    Real LEGO instruction booklets start each bag's build with a page showing
+    that bag's number, and bags are always numbered 1, 2, 3, ... N in page
+    order -- there are no gaps and no re-ordering. ``bags.py`` downstream only
+    needs the sequence of markers to be monotonically increasing, not that any
+    individual number was actually read off the page. That means a page which
+    the local detector recognises structurally as a bag-start page (a tall,
+    lone numeral-shaped glyph: ``bag_marker_candidate=True``) but could not OCR
+    (no Tesseract binary, or an unreadable glyph) can safely be assigned
+    "one more than the last known bag number", without reading any digits.
+
+    This walks ``detections`` in page order (the order given -- callers should
+    pass them sorted by ``page_index``) mutating each ``PageDetection`` in
+    place, tracking ``last_known`` (the last bag number established so far,
+    starting at 0):
+
+    - If ``bag_marker`` was already read via OCR: if it is strictly greater
+      than ``last_known`` it becomes the new ``last_known``. If it is not
+      (OCR misread, or a genuinely out-of-order page), it is left completely
+      untouched -- fixing it up is out of scope here, ``bags.py``'s existing
+      monotonic filter already handles a bad reading -- but a warning is
+      recorded so the discrepancy is visible.
+    - Else if ``bag_marker_candidate`` is ``True`` (a plausible bag-start page
+      with no readable number): ``bag_marker`` is set to ``last_known + 1``,
+      which also becomes the new ``last_known``.
+    - Otherwise (no marker, no candidate) the detection is left untouched.
+
+    Returns a list of human-readable warning strings, one per OCR-read marker
+    that did not extend the running sequence. Does not raise or drop pages.
+    """
+    warnings: List[str] = []
+    last_known = 0
+    for det in detections:
+        if det.bag_marker is not None:
+            if det.bag_marker > last_known:
+                last_known = det.bag_marker
+            else:
+                warnings.append(
+                    f"page {det.page_index}: OCR-read bag_marker={det.bag_marker} does not "
+                    f"exceed the running sequence ({last_known}); left as-is for bags.py's "
+                    "monotonic filter to handle"
+                )
+        elif det.bag_marker_candidate:
+            last_known += 1
+            det.bag_marker = last_known
+    return warnings

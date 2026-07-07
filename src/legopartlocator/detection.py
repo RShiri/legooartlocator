@@ -33,6 +33,12 @@ class PageDetection:
     printed_page_number: Optional[int] = None
     callouts: List[DetectedCallout] = field(default_factory=list)
     notes: Optional[str] = None
+    # Set when the detector finds a plausible tall bag-numeral glyph but cannot
+    # (or does not) read it via OCR -- e.g. no Tesseract binary installed. Lets
+    # callers (see vision_local.assign_ordinal_bag_numbers) assign the bag number
+    # ordinally (1..N in page order) instead of leaving it unknown.
+    bag_marker_candidate: bool = False
+    bag_marker_bbox: Optional[tuple] = None
 
     def to_page_extract(self) -> PageExtract:
         """Project into the pipeline's PageExtract (drops crop bytes)."""

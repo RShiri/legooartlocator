@@ -17,6 +17,7 @@ from legopartlocator.vision_local import (
     DetectConfig,
     LocalDetector,
     TesseractOCR,
+    assign_ordinal_bag_numbers,
     detect_page,
 )
 
@@ -67,6 +68,27 @@ def _page_with_cells(n: int) -> np.ndarray:
 
 def _draw_bag_numeral(page: np.ndarray, x: int = 300, y: int = 400, w: int = 180, h: int = 260) -> None:
     cv2.rectangle(page, (x, y), (x + w, y + h), BLACK, thickness=-1)
+
+
+def _draw_two_digit_bag_numeral(
+    page: np.ndarray,
+    x: int = 300,
+    y: int = 400,
+    w1: int = 70,
+    gap: int = 15,
+    w2: int = 70,
+    h: int = 260,
+) -> tuple:
+    """Draw two adjacent tall black blocks standing in for a "12" numeral.
+
+    Returns the expected merged bbox (x, y, w, h) covering both digits.
+    """
+    cv2.rectangle(page, (x, y), (x + w1, y + h), BLACK, thickness=-1)
+    x2 = x + w1 + gap
+    cv2.rectangle(page, (x2, y), (x2 + w2, y + h), BLACK, thickness=-1)
+    # cv2.rectangle fills both corner pixels inclusive, so each block is
+    # actually (w+1) x (h+1) px; the merged bbox spans both blocks' full extent.
+    return (x, y, w1 + gap + w2 + 1, h + 1)
 
 
 # --- callout detection --------------------------------------------------------
@@ -151,6 +173,75 @@ def test_no_bag_marker_on_page_without_numeral():
     page = _page_with_cells(3)
     result = LocalDetector(ocr=FakeOCR()).detect_page(page, page_index=5)
     assert result.bag_marker is None
+
+
+def test_two_digit_bag_numeral_merges_into_one_candidate():
+    """A two-digit numeral ("12") is two dark contours, but must merge into one bbox."""
+    page = _blank_page()
+    expected_bbox = _draw_two_digit_bag_numeral(page)
+
+    det = LocalDetector(ocr=FakeOCR())
+    gray = det._to_gray(page)
+    candidates = det._find_bag_marker_candidates(gray)
+    assert len(candidates) == 1
+    assert candidates[0] == expected_bbox
+
+    result = LocalDetector(ocr=FakeOCR(bag_text="12")).detect_page(page, page_index=6)
+    assert result.bag_marker == 12
+    assert result.bag_marker_bbox == expected_bbox
+    assert result.bag_marker_candidate is False
+
+
+def test_two_digit_numeral_with_no_ocr_reading_becomes_candidate():
+    """No-Tesseract case: OCR reads "" for every crop; still flagged as a candidate."""
+    page = _blank_page()
+    expected_bbox = _draw_two_digit_bag_numeral(page)
+
+    result = LocalDetector(ocr=FakeOCR(bag_text="")).detect_page(page, page_index=6)
+    assert result.bag_marker is None
+    assert result.bag_marker_candidate is True
+    assert result.bag_marker_bbox == expected_bbox
+
+
+def test_dark_blob_inside_callout_cell_is_not_bag_marker_candidate():
+    """A tall dark render silhouette fully inside a gray cell is not a bag numeral."""
+    page = _blank_page()
+    cell_x, cell_y, cell_w, cell_h = 300, 300, 200, 400
+    cv2.rectangle(page, (cell_x, cell_y), (cell_x + cell_w, cell_y + cell_h), GRAY, thickness=-1)
+    blob_x, blob_y, blob_w, blob_h = 350, 320, 60, 200
+    cv2.rectangle(page, (blob_x, blob_y), (blob_x + blob_w, blob_y + blob_h), BLACK, thickness=-1)
+
+    result = LocalDetector(ocr=FakeOCR()).detect_page(page, page_index=8)
+    assert result.bag_marker is None
+    assert result.bag_marker_candidate is False
+    assert result.bag_marker_bbox is None
+
+
+def test_assign_ordinal_bag_numbers_fills_candidates_in_page_order():
+    detections = [
+        PageDetection(page_index=0, bag_marker_candidate=True),
+        PageDetection(page_index=1),
+        PageDetection(page_index=2, bag_marker_candidate=True),
+        PageDetection(page_index=3, bag_marker=5),
+        PageDetection(page_index=4, bag_marker_candidate=True),
+    ]
+    warnings = assign_ordinal_bag_numbers(detections)
+    assert [d.bag_marker for d in detections] == [1, None, 2, 5, 6]
+    assert warnings == []
+
+
+def test_assign_ordinal_bag_numbers_warns_on_non_monotonic_ocr_read():
+    detections = [
+        PageDetection(page_index=0, bag_marker=5),
+        PageDetection(page_index=1, bag_marker=3),  # contradicts the running sequence
+        PageDetection(page_index=2, bag_marker_candidate=True),
+    ]
+    warnings = assign_ordinal_bag_numbers(detections)
+    # Left untouched -- bags.py's own monotonic filter deals with this, not us.
+    assert detections[1].bag_marker == 3
+    assert len(warnings) == 1
+    # Ordinal assignment continues from the last *valid* running number (5), not 3.
+    assert detections[2].bag_marker == 6
 
 
 # --- robustness + convenience API --------------------------------------------
