@@ -16,10 +16,13 @@ dependencies = [
     "click>=8.1",
     "httpx>=0.27",
     "anthropic>=0.40",
+    "numpy>=1.24",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# Heavy, optional: local image-embedding part matcher (no paid API).
+ml = ["torch>=2.0", "open-clip-torch>=2.20", "pillow>=10.0"]
 
 [project.scripts]
 lpl = "legopartlocator.cli:main"

@@ -81,6 +81,39 @@ lpl scan --extracts samples/demo_extracts.json --no-rebrickable --out out
 the `result.json` it produces — load that in the viewer to see the UI without
 any network or keys.
 
+## Free / local part identification (no paid API)
+
+As an alternative to Claude vision for *identifying* parts, there's an ensemble
+identifier that combines two independent, free signals — both constrained to the
+set's inventory (the answer must be a part the set actually contains, which is
+what makes identification tractable):
+
+- **Brickognize** (`brickognize.py`) — a free, purpose-built LEGO-part model;
+  POST a callout crop, get ranked candidate parts. No key.
+- **Embedding retrieval** (`embedding.py`) — embed the set's inventory reference
+  images once with a pretrained encoder (open_clip, optional `[ml]` extra) and
+  take the nearest neighbour to the crop. No training.
+- **Colour agreement** — the crop's colour vs. the inventory line's colour.
+
+`identify.py` blends these with configurable weights, renormalising over
+whichever signals are present, and returns the best inventory match plus
+alternatives and a per-signal breakdown. The inventory itself is free:
+
+```python
+from legopartlocator.inventory import load_inventory_file      # CSV/JSON, no key
+# or legopartlocator.rebrickable.RebrickableClient (free key)
+```
+
+Install the optional embedding backend with `pip install -e ".[ml]"` (pulls in
+torch + open_clip). The blending, nearest-neighbour math, inventory loading, and
+API parsing are all unit-tested offline; the live Brickognize HTTP call and the
+torch encoder are injected so they're swappable.
+
+> **Status:** the identification subsystem is built and tested. The remaining
+> glue to run it fully on a PDF is (a) OpenCV callout-crop detection (needs
+> tuning against real instruction pages) and (b) wiring the identifier into the
+> reconcile step. Those are the next step once we've seen a real page.
+
 ## Development
 
 ```bash
