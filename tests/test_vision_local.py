@@ -182,7 +182,7 @@ def test_two_digit_bag_numeral_merges_into_one_candidate():
 
     det = LocalDetector(ocr=FakeOCR())
     gray = det._to_gray(page)
-    candidates = det._find_bag_marker_candidates(gray)
+    candidates = det._find_bag_marker_candidates(gray, page)
     assert len(candidates) == 1
     assert candidates[0] == expected_bbox
 
@@ -226,6 +226,69 @@ def test_large_illustration_outline_is_not_bag_marker_candidate():
     cv2.circle(page, (PAGE_W // 2, PAGE_H // 2), 300, BLACK, thickness=15)
 
     result = LocalDetector(ocr=FakeOCR()).detect_page(page, page_index=3)
+    assert result.bag_marker is None
+    assert result.bag_marker_candidate is False
+    assert result.bag_marker_bbox is None
+
+
+def test_dark_saturated_part_render_is_not_bag_marker_candidate():
+    """Regression: a dark but *coloured* part render (e.g. maroon Iron Man
+    armor) can be just as dark in grayscale as a printed numeral, but real
+    ink is low-saturation. Found on a real build-step page (76307 p.13) where
+    a dark-red sub-assembly closeup was wrongly flagged as a bag marker."""
+    page = _blank_page()
+    dark_red_bgr = (20, 20, 120)  # low grayscale value, high HSV saturation
+    cv2.rectangle(page, (300, 400), (480, 660), dark_red_bgr, thickness=-1)
+
+    result = LocalDetector(ocr=FakeOCR()).detect_page(page, page_index=12)
+    assert result.bag_marker is None
+    assert result.bag_marker_candidate is False
+    assert result.bag_marker_bbox is None
+
+
+def test_thin_column_divider_is_not_bag_marker_candidate():
+    """Regression: the hairline rule between two build steps on a two-column
+    page spans nearly the full page height and is near-black, but is far too
+    thin to be a numeral. Found on a real page (76307 p.11) where it was the
+    only surviving bag-marker candidate once colour-render false positives on
+    the same page were filtered out."""
+    page = _blank_page()
+    cv2.line(page, (PAGE_W // 2, 20), (PAGE_W // 2, PAGE_H - 20), BLACK, thickness=2)
+
+    result = LocalDetector(ocr=FakeOCR()).detect_page(page, page_index=10)
+    assert result.bag_marker is None
+    assert result.bag_marker_candidate is False
+    assert result.bag_marker_bbox is None
+
+
+def test_hollow_icon_is_not_bag_marker_candidate():
+    """Regression: a recurring line-art pictogram (a "rotate the model" icon)
+    is tall, near-black, and correctly proportioned, but is a thin-lined
+    hollow shape -- real ink digits are solid, thick strokes with far higher
+    fill. Found recurring dozens of times through a real 56-page booklet."""
+    page = _blank_page()
+    cv2.rectangle(page, (300, 400), (420, 520), BLACK, thickness=6)  # hollow square outline
+
+    result = LocalDetector(ocr=FakeOCR()).detect_page(page, page_index=19)
+    assert result.bag_marker is None
+    assert result.bag_marker_candidate is False
+    assert result.bag_marker_bbox is None
+
+
+def test_textured_pattern_is_not_bag_marker_candidate():
+    """Regression: a busy, high-fill texture (a QR code, tight curly hair on a
+    character illustration) can pass the fill-ratio gate but shatters into far
+    more separate contours than a real digit ever does. Found on real
+    back-matter pages (76307 p.16, p.54, p.56)."""
+    page = _blank_page()
+    x0, y0 = 300, 400
+    cell, step, n = 13, 18, 7  # isolated squares, spaced so none touch (even diagonally)
+    for row in range(n):
+        for col in range(n):
+            x, y = x0 + col * step, y0 + row * step
+            cv2.rectangle(page, (x, y), (x + cell, y + cell), BLACK, thickness=-1)
+
+    result = LocalDetector(ocr=FakeOCR()).detect_page(page, page_index=15)
     assert result.bag_marker is None
     assert result.bag_marker_candidate is False
     assert result.bag_marker_bbox is None

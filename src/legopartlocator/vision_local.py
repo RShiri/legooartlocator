@@ -91,6 +91,38 @@ class DetectConfig:
     bag_marker_max_area_frac: float = 0.10
     bag_marker_max_width_frac: float = 0.35
 
+    # A lower bound on width/height so a page-layout divider (a hairline rule
+    # between two build steps on a two-column page -- full page height, only a
+    # couple of pixels wide) isn't mistaken for a numeral. Found on a real
+    # instruction page where the column-divider line was the only surviving
+    # candidate once a colour-render false positive on the same page was fixed.
+    bag_marker_min_aspect: float = 0.15
+
+    # A bold printed digit is a solid, thick-stroked glyph: a real font digit
+    # fills roughly 45-60% of its own bounding box with ink. Line-art icons and
+    # illustrated part renders are mostly hollow/outline and fill well under
+    # that -- measured ~0.19 (a recurring "rotate" pictogram) to ~0.36 (a
+    # chunky studded-brick closeup) on real false positives from the same
+    # instruction booklet, against ~0.46-0.62 for rendered bold digits 0-9.
+    bag_marker_min_fill_frac: float = 0.42
+
+    # A real digit (or a merged multi-digit run) is one or two simple strokes,
+    # so its near-black mask breaks into only a couple of contours. Busy
+    # textures that otherwise pass every other gate -- a QR code, tight curly
+    # hair on a character illustration, a studded part close-up -- shatter
+    # into dozens of tiny contours instead. Measured 2-3 contours for real
+    # rendered digits vs. 28-102 for those real false positives.
+    bag_marker_max_components: int = 8
+
+    # A real bag-start numeral is printed in black ink (low HSV saturation)
+    # even though it renders "near-black" in grayscale. Dark *coloured* plastic
+    # (e.g. a maroon/navy part render) can be just as dark in grayscale but is
+    # far more saturated. Found on a real instruction page where a dark-red
+    # sub-assembly render (Iron Man armor) was wrongly flagged as a bag-marker
+    # candidate on an ordinary build-step page -- mean HSV saturation of its
+    # dark pixels was ~157 vs. ~30 for a real printed numeral on the same page.
+    bag_marker_max_saturation: int = 90
+
 
 @runtime_checkable
 class OCR(Protocol):
@@ -316,7 +348,7 @@ class LocalDetector:
         return callouts
 
     def _find_bag_marker_candidates(
-        self, gray: np.ndarray
+        self, gray: np.ndarray, img: np.ndarray
     ) -> List[Tuple[int, int, int, int]]:
         """Find candidate bag-numeral bboxes, merging adjacent multi-digit glyphs.
 
@@ -381,10 +413,39 @@ class LocalDetector:
         page_area = float(height * width)
         max_area = cfg.bag_marker_max_area_frac * page_area
         max_w = cfg.bag_marker_max_width_frac * width
-        merged = [b for b in merged if (b[2] * b[3]) <= max_area and b[2] <= max_w]
+        merged = [
+            b
+            for b in merged
+            if (b[2] * b[3]) <= max_area
+            and b[2] <= max_w
+            and (b[2] / b[3]) >= cfg.bag_marker_min_aspect
+        ]
 
-        merged.sort(key=lambda b: b[2] * b[3], reverse=True)
-        return merged
+        # Reject dark but saturated (coloured) shapes: a real printed numeral is
+        # black ink (low saturation) even where a dark plastic part render is
+        # just as dark in grayscale. Checked only over the pixels that actually
+        # tripped the near-black mask, not the whole bbox (which may include
+        # lighter background/anti-aliasing).
+        saturation = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)[:, :, 1]
+        kept: List[Tuple[int, int, int, int]] = []
+        for b in merged:
+            x, y, w, h = b
+            region_mask = mask[y : y + h, x : x + w]
+            if region_mask.size == 0:
+                continue
+            fill_frac = float((region_mask > 0).mean())
+            if fill_frac < cfg.bag_marker_min_fill_frac:
+                continue
+            region_sat = saturation[y : y + h, x : x + w][region_mask > 0]
+            if region_sat.size and region_sat.mean() > cfg.bag_marker_max_saturation:
+                continue
+            n_components = len(_find_contours(region_mask))
+            if n_components > cfg.bag_marker_max_components:
+                continue
+            kept.append(b)
+
+        kept.sort(key=lambda b: b[2] * b[3], reverse=True)
+        return kept
 
     def _detect_bag_marker(
         self,
@@ -408,7 +469,7 @@ class LocalDetector:
         ``bag_marker_bbox`` so a caller can assign the number structurally
         (see :func:`assign_ordinal_bag_numbers`) instead of losing it.
         """
-        candidates = self._find_bag_marker_candidates(gray)
+        candidates = self._find_bag_marker_candidates(gray, img)
         plausible = [
             c
             for c in candidates

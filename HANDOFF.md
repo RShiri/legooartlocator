@@ -7,8 +7,8 @@ for how the tool itself works.
 ## Where things stand
 
 **Repo:** `RShiri/legooartlocator` — branch `claude/lego-pdf-part-scanner-lc3aiu`
-**Last commit:** `9c94f48` — "Suppress bag-marker detection on dense/parts-list pages"
-**Tests:** 94 passing, all offline (`pytest`)
+**Last commit:** `675e81c` (prior to this session's uncommitted bag-marker fixes below)
+**Tests:** 98 passing, all offline (`pytest`) — 94 prior + 4 new this session
 **User's environment:** Windows, Python venv at `.venv`, `run.bat` wrapper
 (`run scan ...` / `run debug ...`), no Tesseract binary installed, no paid
 API keys purchased yet.
@@ -70,17 +70,62 @@ Both fixes shipped with regression tests reproducing the exact real-page
 shapes. User confirmed page 4's box was gone after the fix ("Page 1's bag?
 box should be gone now. true").
 
+## This session: full-booklet calibration, three more real false positives found and fixed
+
+Ran detection across the **entire** 76307 booklet (56 pages, not just a
+slice) this time, using a script that calls `detect_page` directly with a
+null OCR (mirrors the CLI's no-Tesseract fallback) so every page's
+`bag_marker_candidate`/`bag_marker_bbox` could be inspected at once instead of
+one `--pages` range at a time. That surfaced **three more real false-positive
+classes**, all confirmed against actual rendered pages from `6559641.pdf` (not
+speculative) and all now fixed in `vision_local.py`'s
+`_find_bag_marker_candidates`, with regression tests in
+`tests/test_vision_local.py`:
+
+1. **Dark but saturated colour renders** (e.g. the maroon Iron Man armor sub-
+   assembly on page 13) — just as dark in grayscale as a printed numeral, but
+   real ink is low-saturation while coloured plastic isn't. Measured mean HSV
+   saturation ~157 for the false positive vs. ~30 for a real numeral on the
+   same page. Fix: `bag_marker_max_saturation` (default 90) rejects candidates
+   whose near-black pixels average above it.
+2. **The page-column divider hairline** (full page height, ~2px wide) — once
+   the colour-render candidates above were filtered out, this thin rule
+   became the highest-priority survivor on two-column pages. Fix:
+   `bag_marker_min_aspect` (default 0.15) rejects anything absurdly thin.
+3. **Hollow/textured shapes that are still low-saturation black-on-white** — a
+   recurring "rotate the model" icon (appeared ~15 times through the book,
+   identical 114×114px pictogram), a studded-brick closeup, a QR code, and a
+   character illustration's curly hair all passed every gate above. Real bold
+   printed digits are solid, thick strokes (measured fill ratio ~0.46-0.62 for
+   rendered digits 0-9 via PIL); these hollow/textured false positives were
+   ~0.19-0.48 fill and, for the QR code/hair, shattered into 28-102 separate
+   contours vs. 2-3 for a real digit. Fix: `bag_marker_min_fill_frac` (0.42)
+   and `bag_marker_max_components` (8).
+
+**Result: zero bag-marker candidates across all 56 pages of the real booklet**
+after all three fixes (down from ~20 false positives on the first full-book
+pass, all traced to one of the three classes above). This strongly suggests
+**76307 genuinely ships as a single unnumbered bag** — a small ~150-piece set
+with no printed "Bag N" pages at all — rather than there being an undetected
+real marker still hiding somewhere. No uncorroborated guess: every one of
+these was visually confirmed by rendering the exact page and cropping the
+exact bbox the detector had flagged.
+
+**Not yet committed** — these changes are sitting in the working tree
+(`vision_local.py`, `tests/test_vision_local.py`), ready for a commit once
+reviewed; tests are at 98 passing (94 prior + 4 new).
+
 ## Immediate next step
 
-Pick up the calibration loop where it left off:
-
-1. `run debug 6559641.pdf --out out\debugN --pages 1-30` (or a wider range) —
-   the goal is to reach an **actual bag-start page** (bag 1, 2, ...) and
-   confirm it's detected correctly. Every real page seen so far has been
-   front-matter (cover, intro illustration); no genuine bag marker has been
-   visually confirmed yet.
-2. Once detection looks right, run the **full identify pipeline** for the
-   first time on a real set:
+1. Commit the three bag-marker false-positive fixes above (or ask the user
+   first, per the no-auto-commit norm).
+2. Since this set (76307) appears to have no numbered bags at all, the
+   ordinal-bag-numbering path won't be exercised in a meaningful way by this
+   particular PDF — worth keeping in mind when judging a real `lpl scan`
+   result against it (expect everything in a single implicit bag, not "Bag 1,
+   2, 3..."). If the user wants to validate ordinal numbering specifically, a
+   *larger* multi-bag set's PDF would be a better calibration target.
+3. Run the **full identify pipeline** for the first time on a real set:
    ```
    run scan 6559641.pdf --engine local --inventory-file inv.csv --out out
    ```
@@ -88,7 +133,7 @@ Pick up the calibration loop where it left off:
    `--set 76307` with a `REBRICKABLE_API_KEY` instead). This has never been
    run against a real PDF — accuracy of the Brickognize/colour identification
    ensemble on real crops is completely unverified.
-3. Load `out/result.json` into `web/index.html` (drag-drop) and sanity-check
+4. Load `out/result.json` into `web/index.html` (drag-drop) and sanity-check
    a few parts against the physical instructions.
 
 ## Known open items (not yet started, roughly ranked)
@@ -110,7 +155,13 @@ Pick up the calibration loop where it left off:
   as "cells", tripping `is_parts_list`) are currently harmless — such pages
   are already excluded from parts attribution — but worth a note if it ever
   causes a *real* build-step page to be wrongly treated as front matter.
+- **76307 appears to have zero printed bag markers** (single-bag set) — the
+  ordinal-numbering path (`assign_ordinal_bag_numbers`) is unit-tested but has
+  never been exercised end-to-end on a real multi-bag PDF. If validating that
+  specifically matters, get a bigger set's instructions (multiple numbered
+  bags) rather than continuing to calibrate against this one.
 - **No PR opened** for this branch — user hasn't asked for one yet.
+- **This session's fixes are uncommitted** — see "This session" section above.
 
 ## Full session history (condensed)
 
@@ -152,6 +203,12 @@ Pick up the calibration loop where it left off:
    under "What's proven with real data") were found and fixed as a direct
    result — not something unit tests alone would have caught, since they
    were shape/size miscalibrations specific to real illustration artwork.
+6. **Full-booklet calibration** (this session): ran detection across all 56
+   pages of the same real PDF at once (not just a slice), found and fixed
+   three more real false-positive classes (colour-saturated part renders, a
+   thin column-divider line, hollow/textured shapes like icons/QR codes/hair)
+   — see "This session" section above for the full writeup. Zero false
+   positives remain across the whole booklet.
 
 ## Resume prompt
 
@@ -165,14 +222,17 @@ tool works.
 
 Short version: it's a LEGO instruction-PDF scanner that maps parts to
 bag/page. Two engines: a paid Claude-vision engine and a free local
-OpenCV+Brickognize engine (`lpl scan --engine local`). 94 tests pass.
+OpenCV+Brickognize engine (`lpl scan --engine local`). 98 tests pass.
 
-I've been running `lpl debug <pdf> --pages N-M` against my real set 76307 PDF
-(6559641.pdf) and sending back page screenshots for calibration -- two real
-bag-marker false positives were already found and fixed this way. No full
-`lpl scan` (the identify pipeline) has been run yet, only detection
-calibration via `lpl debug`.
+Calibration against the real 76307 PDF (6559641.pdf) has now covered the
+*entire* 56-page booklet and found/fixed five real bag-marker false-positive
+bugs total across two sessions (two from page-slice screenshots, three more
+from a full-booklet pass) -- zero false positives remain. This set appears to
+have no printed bag numbers at all (single-bag set). These latest three fixes
+are uncommitted in the working tree. No full `lpl scan` (the identify
+pipeline) has been run yet, only detection calibration.
 
-Next: [paste your latest `lpl debug`/`lpl scan` output or a page screenshot
-here, or say "let's run debug on pages X-Y next" to continue calibration].
+Next: commit the pending bag-marker fixes (ask first), then run the full
+`lpl scan --engine local` identify pipeline for the first time on a real set
+-- see "Immediate next step" above.
 ```
