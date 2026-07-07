@@ -7,8 +7,8 @@ for how the tool itself works.
 ## Where things stand
 
 **Repo:** `RShiri/legooartlocator` — branch `claude/lego-pdf-part-scanner-lc3aiu`
-**Last commit:** `0a58a34` (prior to this session's second batch of fixes below, not yet committed)
-**Tests:** 100 passing, all offline (`pytest`) — 94 prior + 6 new this session
+**Last commit:** `c9a8a0c`
+**Tests:** 103 passing, all offline (`pytest`)
 **User's environment:** Windows, Python venv at `.venv`, `run.bat` wrapper
 (`run scan ...` / `run debug ...`), no Tesseract binary installed, no paid
 API keys purchased yet.
@@ -170,36 +170,114 @@ session went further than calibration:
    book's visual variety is real progress, not full coverage. Not yet
    pursued further — this is a reasonable point to test against a bigger,
    more classically-styled set instead of continuing to squeeze this one.
-6. **These fixes are also uncommitted** — `vision_local.py` (the border
-   detector) and `tests/test_vision_local.py` (2 new regression tests, one
-   reproducing "fill colour matches background" via a synthetic same-tone
-   page, one confirming a circular ink-loop is correctly rejected by the
-   extent gate). Tests are at 100 passing (94 + 4 bag-marker + 2 these).
+6. Committed as `419dd9e`. Tests at 100 passing (94 + 4 bag-marker + 2 these).
+
+## Then: tested a real bigger multi-booklet set (76269, "Avengers Tower") — this is what the user meant by "test bigger PDFs"
+
+76269 has **3 separate PDF booklets** (fetched via `lpl scan --set 76269
+--engine local` — the built-in auto-fetch worked fine from this sandbox, no
+browser workaround needed): `6488032.pdf` (276pp, booklet 1), `6488034.pdf`
+(188pp, booklet 2), `6495251.pdf` (180pp, booklet 3) — **644 pages total**.
+This is a genuinely large, classically-styled set (5202 parts per
+Rebrickable — far beyond the browser-scraping approach used for 76307; see
+"Known open items").
+
+1. **Real classic white-background panel style confirmed** — `lpl debug` on
+   booklet 1 showed genuine "1x"/"2x" gray panels detected correctly by the
+   original fill-colour detector, unlike 76307's tinted-background case.
+2. **Found and fixed a real bag-marker gap: circled-digit markers.** Each
+   booklet's cover has a real marker — a digit inside a circle (e.g. "②" on
+   booklet 1's cover), not a solid filled numeral. It was invisible for two
+   compounding reasons, both real regressions caught by testing against
+   *both* real booklets before committing (a lesson from earlier this
+   session, worth repeating: any new gate must be re-checked against every
+   previously-fixed real page, not just the page that motivated it):
+   - `bag_marker_min_height_frac` (0.12) assumes the marker dominates the
+     page; on this busier booklet the real marker is a small corner badge
+     (~0.07 of page height). Lowering the *global* floor to accommodate it
+     reintroduced a real bug: 76307's per-step counter digits (also ~0.06 of
+     page height, solid, not circled) then also qualified as candidates on
+     30+ pages. Fix: a **separate**, more permissive height floor
+     (`bag_marker_ring_min_height_frac`) that only applies to the new ring
+     branch below, not solid digits.
+   - A circled digit's fill ratio (~0.32 measured) is below
+     `bag_marker_min_fill_frac` (0.42, tuned earlier this session
+     specifically to reject hollow icons). Added a second acceptance path,
+     `bag_marker_ring_*`, but a naive "lower fill + few components" version
+     wasn't enough on its own: a two-digit number like "20" also breaks into
+     exactly 2 disconnected ink blobs (same component count as ring+digit).
+     The real distinguishing signal is geometric — a ring's own bbox spans
+     nearly the *whole* merged candidate (~0.87 measured, since the digit
+     nests inside it) while two side-by-side digits split the box roughly
+     evenly (~0.44-0.46 each); gated on that
+     (`bag_marker_ring_min_dominant_frac`).
+   - Also removed the blunt "never detect a bag marker on an is_parts_list
+     page" rule (added earlier this session) — it was suppressing the real
+     marker on 76269's cover, whose illustration (a building render's window
+     panes) independently trips the BOM-page cell-count threshold on its own
+     unrelated false positives. Confirmed safe first: re-ran detection on all
+     of 76307's real front-matter pages *without* the rule and got zero
+     false positives, proving the finer-grained gates added earlier this
+     session (saturation, aspect, fill, components) already cover the
+     original case that rule was written for.
+3. **Result, verified against real data from both sets**: all 3 booklets'
+   real covers now correctly detected as bag-marker candidates — visually
+   confirmed by cropping and viewing each: booklet 1 = "②", booklet 2 = "③",
+   booklet 3 = "⑦" (the numbering scheme spans booklets: each booklet covers
+   a range of bags, e.g. booklet 3 alone covers up to bag 7 — real,
+   previously-unseen structure this tool had never encountered). 76307
+   remains clean (2 rare false positives out of 56 pages, down from a
+   mid-fix regression peak of 34 — see commit `c9a8a0c` for the full
+   before/after numbers). 76269 has its own residual false positives too:
+   **12 out of 644 pages** (~2%) — spot-checked several (a studded-brick
+   render, a technic-gear closeup, a minifig render, a decorative angled
+   shape) and they're the same general "illustration element coincidentally
+   digit-shaped" class as 76307's, just not yet individually chased down.
+   Committed as `c9a8a0c`, 103 tests passing (100 + 5 new: circled-digit
+   accepted, two-digit-number-at-ring-height correctly rejected, plus
+   3 renamed/adjusted for the is_parts_list-suppression removal).
+4. **Inventory not obtained for 76269** — 5202 parts is far too many to
+   scrape via the browser accessibility-tree approach used for 76307 (that
+   was fine for 49 rows, not thousands). No `lpl scan` identify-pipeline run
+   was attempted on 76269 as a result — this session's 76269 work was
+   detection-layer only (bag markers + panel style), not identification.
 
 ## Immediate next step
 
-1. Commit the callout-panel border-detector fix above (or ask the user
-   first, per the no-auto-commit norm).
-2. **User's stated plan: test bigger PDFs next.** A larger, more classically
-   laid-out set (white page background, one bag-start page per bag) should
-   exercise the ordinal bag-numbering path (never really tested — 76307
-   appears to have zero printed bag markers, i.e. ships as a single bag) and
-   may hit the fill-colour panel detector's original happy path instead of
-   needing the new border detector at all. Worth comparing both booklets'
-   panel style once a bigger PDF is in hand.
-3. If pushing 76307's identification further is wanted later: 11/42 parts
-   still unidentified, and quantities are undercounts (only the front-matter
-   BOM-recap panels got fully swept; some per-step panels are likely still
-   missed) — `samples/76307_inventory.csv` plus a fresh run of:
+1. **12 residual bag-marker false positives on 76269** (~2% of 644 pages) —
+   not yet individually diagnosed the way 76307's were; same general
+   "illustration element happens to look digit-shaped" class. Worth another
+   calibration pass if ordinal bag-numbering accuracy on this specific set
+   matters, using the same rigor as this session (crop the real page, measure
+   the real pixel stats, don't guess).
+2. **Get a real inventory for 76269 to actually run `lpl scan`.** Two paths:
+   - Ask the user for a free `REBRICKABLE_API_KEY` (a real account signup —
+     not something this agent should do itself; a few minutes at
+     rebrickable.com/api/). Then: `run scan 6488032.pdf --engine local --set 76269 --out out`.
+   - Or accept a much rougher, unconstrained scan with no inventory at all
+     (`BrickognizeOnlyIdentifier`, lower precision, no closed-set
+     constraint, no count validation) — already the fallback path, no new
+     work needed, just lower accuracy.
+3. If pushing 76307's identification further is wanted: 11/42 parts still
+   unidentified, quantities undercounted — `samples/76307_inventory.csv` plus
+   a fresh run of:
    ```
    run scan 6559641.pdf --engine local --inventory-file samples/76307_inventory.csv --out out
    ```
    are the starting point (result isn't committed — regenerate).
 4. Load `out/result.json` into `web/index.html` (drag-drop) and sanity-check
-   a few parts against the physical instructions.
+   a few parts against the physical instructions, for whichever set has a
+   fresh scan result.
 
 ## Known open items (not yet started, roughly ranked)
 
+- **12/644 pages on 76269 still have bag-marker false positives (~2%).** Not
+  yet individually diagnosed — see "Then: tested a real bigger multi-booklet
+  set" above.
+- **76269 has no inventory and no `lpl scan` has been run on it.** 5202 parts
+  is too many for the browser-scraping approach used for 76307 — needs a real
+  `REBRICKABLE_API_KEY` (user has to sign up themselves; not something this
+  agent should do). See "Immediate next step" above.
 - **11/42 parts on 76307 still unidentified, quantities undercounted.** The
   border-based panel detector is real progress (9→43 parts found, 31 matched
   to a real part_num) but not full coverage — see "Then: got a real inventory
@@ -210,25 +288,25 @@ session went further than calibration:
 - **Tesseract not installed** on the user's machine — quantities currently
   default to 1 on the local engine (bag numbers work fine without it, via
   ordinal assignment). Installing Tesseract would unlock real quantity/part-ID
-  OCR; not yet requested by the user.
+  OCR, and would let 76269's real circled bag/booklet numbers (2, 3, 7) be
+  read directly instead of relying on ordinal assignment; not yet requested
+  by the user.
 - Cover/BOM-style pages' callout-like false detections (logos/badges counted
   as "cells", tripping `is_parts_list`) are currently harmless — such pages
-  are already excluded from parts attribution — but worth a note if it ever
-  causes a *real* build-step page to be wrongly treated as front matter.
-- **76307 appears to have zero printed bag markers** (single-bag set) — the
-  ordinal-numbering path (`assign_ordinal_bag_numbers`) is unit-tested but has
-  never been exercised end-to-end on a real multi-bag PDF. Bigger PDFs (the
-  user's planned next step) are a better test of this.
+  are already excluded from parts attribution.
 - **rebrickable.com and lego.com return HTTP 403 to `curl`/WebFetch from this
   sandbox** (Cloudflare bot-challenge) — confirmed it's bot detection, not a
   network block (`curl https://www.google.com` works). The claude-in-chrome
   MCP (a real browser session) gets through fine; that's how
-  `samples/76307_inventory.csv` was obtained with no API key. Worth reusing
-  this approach for bigger sets' inventories too, unless the user has a
-  `REBRICKABLE_API_KEY` by then.
+  `samples/76307_inventory.csv` was obtained with no API key. Note this only
+  scales to small sets (~50 parts) — 76269's 5202 parts is too many rows to
+  scrape this way; a real API key is the right tool past that size.
+  Separately, `lpl scan --set NNNN`'s *own* built-in auto-fetch (`fetcher.py`,
+  hits lego.com to find the PDF download link, not Rebrickable) worked fine
+  from this same sandbox for 76269 — so the 403 issue is specific to
+  Rebrickable's/lego.com's *webpage* bot-challenge, not their PDF/API
+  endpoints generally.
 - **No PR opened** for this branch — user hasn't asked for one yet.
-- **This session's callout-panel border-detector fix is uncommitted** — see
-  "Then: got a real inventory ..." section above.
 
 ## Full session history (condensed)
 
@@ -285,7 +363,19 @@ session went further than calibration:
    (page background and panel fill are the same grayscale tone), and fixed it
    with a second border-based detector — 43 parts located (up from 9), 31 of
    them correctly matched by part number (out of 42 real inventory parts).
-   See "Then: got a real inventory ..." section above. Not yet committed.
+   See "Then: got a real inventory ..." section above. Committed as `419dd9e`.
+8. **Tested a real bigger multi-booklet set** (76269, "Avengers Tower", 3
+   PDF booklets, 644 pages, 5202 parts — this is what the user meant by
+   "test bigger PDFs"): confirmed the classic white-panel style works out of
+   the box on a bigger set; found and fixed a real, previously-unseen
+   bag-marker style (a digit inside a circle, not solid-filled) via two new
+   gates plus removed a now-redundant blunt suppression rule — verified all
+   3 booklets' real covers ("②", "③", "⑦") are now correctly detected, and
+   confirmed no regression on 76307 (2 rare false positives, down from a
+   mid-fix regression peak of 34). See "Then: tested a real bigger
+   multi-booklet set" section above. Committed as `c9a8a0c`. 76269 has no
+   inventory yet (5202 parts is too many to scrape via browser) and no
+   `lpl scan` has been run on it — detection-layer validation only so far.
 
 ## Resume prompt
 
@@ -299,22 +389,23 @@ tool works.
 
 Short version: it's a LEGO instruction-PDF scanner that maps parts to
 bag/page. Two engines: a paid Claude-vision engine and a free local
-OpenCV+Brickognize engine (`lpl scan --engine local`). 100 tests pass.
+OpenCV+Brickognize engine (`lpl scan --engine local`). 103 tests pass, all
+committed (`c9a8a0c`).
 
-Calibration against the real 76307 PDF (6559641.pdf) covered the entire
-56-page booklet: five bag-marker false-positive bugs found/fixed (committed,
-`0a58a34`), zero remain; this set appears to have no printed bag numbers at
-all (single-bag set). Then got a real inventory for 76307 with no API key
-(rebrickable.com/lego.com block plain HTTP fetches -- used the claude-in-chrome
-MCP instead, saved as `samples/76307_inventory.csv`) and ran the full
-`lpl scan --engine local` identify pipeline for the first time ever. It
-initially found almost nothing (9/42 parts, all colour-only) because the
-callout-panel detector couldn't isolate real panels on this booklet's
-pale-blue-background style; fixed with a second border-based panel detector
--- now 43 parts located, 31 correctly matched by part number. That fix is
-**uncommitted** in the working tree.
+Two real sets tested so far. **76307** (Iron Man Mech, 56 pages, single
+unnumbered bag): full detection calibration done (zero bag-marker false
+positives), first-ever identify-pipeline run got 43/42 parts located (31
+correctly matched by part number) using samples/76307_inventory.csv (a real
+Rebrickable export, no API key needed for a set this small). **76269**
+(Avengers Tower, 3 booklets / 644 pages / 5202 parts -- the "bigger PDF"
+test): confirmed the classic white-panel style works natively, found and
+fixed a new bag-marker style (circled digits, e.g. "②"/"③"/"⑦" -- one per
+booklet, real structure never seen before), verified all 3 real covers now
+detected correctly. 76269 has ~2% residual bag-marker false positives (not
+yet diagnosed) and no inventory yet (5202 parts is too many to scrape via
+browser -- needs the user to get a free REBRICKABLE_API_KEY).
 
-Next: commit the callout-panel border-detector fix (ask first), then per the
-user's plan, test against a bigger/more classically-styled set PDF -- see
-"Immediate next step" above.
+Next: see "Immediate next step" in HANDOFF.md -- likely either chasing
+76269's remaining false positives, or getting a REBRICKABLE_API_KEY to
+finally run a full identify pipeline on a big multi-booklet set.
 ```
