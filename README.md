@@ -172,7 +172,7 @@ available on `lpl scan --engine local`) once you know what to change.
 ## Development
 
 ```bash
-pytest         # offline unit tests (92): bags, reconcile, local engine, identify, etc.
+pytest         # offline unit tests (94): bags, reconcile, local engine, identify, etc.
 ```
 
 CI (`.github/workflows/ci.yml`) runs the suite on Ubuntu (3.11, 3.12) and
