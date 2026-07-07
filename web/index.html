@@ -41,6 +41,33 @@
   #drop.hi { border-color:var(--accent); color:var(--fg); }
   .count { color:var(--muted); font-size:13px; margin-bottom:8px; }
   code { background:var(--panel); padding:1px 5px; border-radius:5px; }
+
+  #warningsPanel { border-bottom:1px solid var(--border); background:rgba(217,158,0,0.08); }
+  #warningsPanel summary { padding:10px 20px; cursor:pointer; color:var(--accent);
+    font-weight:600; list-style:none; display:flex; align-items:center; gap:8px; font-size:14px; }
+  #warningsPanel summary::-webkit-details-marker { display:none; }
+  #warningsPanel .badge { background:var(--accent); color:#000; border-radius:999px;
+    padding:1px 8px; font-size:12px; font-weight:700; }
+  #warningsPanel ul { margin:0; padding:2px 20px 14px 42px; color:var(--fg); font-size:13px; }
+  #warningsPanel li { margin:4px 0; }
+
+  .bagRow { display:flex; gap:10px; overflow-x:auto; padding-bottom:8px; margin-bottom:16px; }
+  .bagCard { flex:0 0 auto; min-width:110px; background:var(--panel); border:1px solid var(--border);
+    border-radius:10px; padding:10px 14px; cursor:pointer; }
+  .bagCard:hover { border-color:var(--accent); }
+  .bagCard.active { border-color:var(--accent); box-shadow:0 0 0 2px var(--accent) inset; }
+  .bagCard .bagTitle { font-weight:700; font-size:14px; }
+  .bagCard .bagPages { color:var(--muted); font-size:12px; margin:2px 0 6px; white-space:nowrap; }
+  .bagCard .bagStats { font-size:12px; display:flex; gap:8px; white-space:nowrap; }
+  .bagCard .bagMismatch { color:var(--bad); font-weight:600; }
+
+  tr.bad-row td { background:rgba(255,107,107,0.09); }
+  tr.bad-row:hover td { background:rgba(255,107,107,0.16); }
+  tr[data-idx] { cursor:pointer; }
+  tr.subrow td { background:var(--panel); padding:8px 10px 12px 40px; }
+  .occTable { width:100%; border-collapse:collapse; font-size:13px; }
+  .occTable th, .occTable td { padding:5px 10px; border-bottom:1px solid var(--border); }
+  .occTable th { color:var(--muted); font-weight:600; text-align:left; }
 </style>
 </head>
 <body>
@@ -48,6 +75,10 @@
   <h1>🧱 LEGO Part Locator</h1>
   <span class="meta" id="setMeta"></span>
 </header>
+<details id="warningsPanel" hidden>
+  <summary>Warnings <span class="badge" id="warnCount">0</span></summary>
+  <ul id="warnList"></ul>
+</details>
 <div class="wrap">
   <div id="loader">
     <div id="drop">
@@ -61,6 +92,7 @@
   </div>
 
   <div id="app" hidden>
+    <div class="bagRow" id="bagCards" hidden></div>
     <div class="controls">
       <input id="q" type="search" placeholder="Search part name, colour, element id, or part number…" />
       <select id="bagFilter"><option value="">All bags</option></select>
@@ -91,6 +123,7 @@
 <script>
 let DATA = null;
 let sortKey = "bags", sortDir = 1;
+let shownParts = [];
 
 function h(s){ return (s==null?"":String(s)).replace(/[&<>"]/g, c => (
   {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
@@ -100,18 +133,72 @@ function load(data){
   document.getElementById("loader").hidden = true;
   document.getElementById("app").hidden = false;
   const meta = [data.set_name, data.set_num && ("#"+data.set_num),
-    (data.parts?.length||0)+" parts", (data.reconciled?"reconciled":"vision-only")]
+    (data.parts?.length||0)+" parts",
+    data.num_pages!=null ? data.num_pages+" pages" : null,
+    (data.reconciled?"reconciled":"vision-only")]
     .filter(Boolean).join(" · ");
   document.getElementById("setMeta").textContent = meta;
-  const bags = [...new Set((data.parts||[]).flatMap(p=>p.bags||[]))].sort((a,b)=>a-b);
+  const metaBags = (data.bags||[]).map(b=>b.bag);
+  const partBags = (data.parts||[]).flatMap(p=>p.bags||[]);
+  const bags = [...new Set([...partBags, ...metaBags])].sort((a,b)=>a-b);
   const bf = document.getElementById("bagFilter");
-  bags.forEach(b => { const o=document.createElement("option"); o.value=b; o.textContent="Bag "+b; bf.appendChild(o); });
+  bags.forEach(b => { const o=document.createElement("option"); o.value=b; o.textContent=(b===0?"Intro":"Bag "+b); bf.appendChild(o); });
+  renderWarnings(data.warnings);
+  renderBagCards(data);
   render();
 }
 
 function statusOf(p){
   if(!p.reconciled) return "vision";
   return p.count_matches ? "ok" : "bad";
+}
+
+function renderWarnings(warnings){
+  const panel = document.getElementById("warningsPanel");
+  const list = document.getElementById("warnList");
+  const count = document.getElementById("warnCount");
+  if(!warnings || !warnings.length){
+    panel.hidden = true; panel.open = false; list.innerHTML = ""; count.textContent = "0";
+    return;
+  }
+  panel.hidden = false;
+  count.textContent = String(warnings.length);
+  list.innerHTML = warnings.map(w => `<li>${h(w)}</li>`).join("");
+}
+
+function renderBagCards(data){
+  const row = document.getElementById("bagCards");
+  const bagsMeta = data.bags || [];
+  if(!bagsMeta.length){ row.hidden = true; row.innerHTML = ""; return; }
+  row.hidden = false;
+  const parts = data.parts || [];
+  row.innerHTML = bagsMeta.map(b => {
+    const n = b.bag;
+    const label = n===0 ? "Intro" : "Bag "+n;
+    const startP = (b.start_page??0)+1, endP = (b.end_page??b.start_page??0)+1;
+    const pagesLabel = startP===endP ? `page ${startP}` : `pages ${startP}–${endP}`;
+    const inBag = parts.filter(p => (p.bags||[]).includes(n));
+    const mismatches = inBag.filter(p => statusOf(p)==="bad").length;
+    return `<div class="bagCard" data-bag="${n}">
+      <div class="bagTitle">${h(label)}</div>
+      <div class="bagPages">${h(pagesLabel)}</div>
+      <div class="bagStats"><span>${inBag.length} part(s)</span>${mismatches?`<span class="bagMismatch">${mismatches} mismatch</span>`:""}</div>
+    </div>`;
+  }).join("");
+  row.querySelectorAll(".bagCard").forEach(card => card.addEventListener("click", ()=>{
+    const n = card.dataset.bag;
+    const bf = document.getElementById("bagFilter");
+    bf.value = (bf.value === n) ? "" : n;
+    render();
+  }));
+  updateBagCardActive();
+}
+
+function updateBagCardActive(){
+  const bag = document.getElementById("bagFilter").value;
+  document.querySelectorAll(".bagCard").forEach(card => {
+    card.classList.toggle("active", bag !== "" && card.dataset.bag === bag);
+  });
 }
 
 function render(){
@@ -130,15 +217,26 @@ function render(){
     if(x==null)x=-Infinity; if(y==null)y=-Infinity;
     return (x>y?1:x<y?-1:0)*sortDir;
   });
+  shownParts = rows;
   document.getElementById("count").textContent = rows.length+" part(s) shown";
-  document.getElementById("rows").innerHTML = rows.map(p => {
+  document.getElementById("rows").innerHTML = rows.map((p,i) => {
     const bags = (p.bags||[]).map(b=>`<span class="bag">${b}</span>`).join("");
     const pages = (p.pages||[]).map(x=>x+1).join(", ");
     const stc = statusOf(p);
-    const inv = p.inventory_qty==null ? "—"
-      : `<span class="${stc==='ok'?'ok':stc==='bad'?'bad':''}">${p.inventory_qty}</span>`;
+    let inv = "—";
+    if(p.inventory_qty!=null){
+      const invCls = stc==='ok'?'ok':stc==='bad'?'bad':'';
+      let delta = "";
+      if(stc==='bad' && p.total_seen!=null){
+        const d = p.total_seen - p.inventory_qty;
+        const sign = d<0 ? "−"+Math.abs(d) : "+"+d;
+        delta = ` <span class="pages">(${sign} seen)</span>`;
+      }
+      inv = `<span class="${invCls}">${h(p.inventory_qty)}</span>${delta}`;
+    }
     const img = p.image_url ? `<img class="thumb" src="${h(p.image_url)}" loading="lazy" alt="">` : "";
-    return `<tr>
+    const rowCls = stc==='bad' ? ' class="bad-row"' : '';
+    return `<tr data-idx="${i}"${rowCls}>
       <td>${img}</td>
       <td>${h(p.name)||"<span class='pill'>unknown</span>"}${p.part_num?` <span class="pill">${h(p.part_num)}</span>`:""}</td>
       <td>${h(p.color_name)}</td>
@@ -149,14 +247,39 @@ function render(){
       <td>${(p.confidence??0).toFixed(2)}</td>
     </tr>`;
   }).join("");
+  updateBagCardActive();
 }
 
-document.querySelectorAll("th[data-k]").forEach(th => th.addEventListener("click", ()=>{
+document.querySelectorAll("th[data-k]").forEach(th => th.addEventListener("click", (e)=>{
+  e.stopPropagation();
   const k=th.dataset.k; if(!k) return;
   if(sortKey===k) sortDir*=-1; else { sortKey=k; sortDir=1; }
   render();
 }));
 ["q","bagFilter","statusFilter"].forEach(id=>document.getElementById(id).addEventListener("input",render));
+
+// Row expansion: click a part row to reveal its per-occurrence breakdown.
+document.getElementById("rows").addEventListener("click", e=>{
+  const tr = e.target.closest("tr[data-idx]");
+  if(!tr) return;
+  const idx = tr.dataset.idx;
+  const existing = tr.nextElementSibling;
+  const wasOpen = !!(existing && existing.classList.contains("subrow") && existing.dataset.owner===idx);
+  document.querySelectorAll("tr.subrow").forEach(el=>el.remove());
+  if(wasOpen) return;
+  const p = shownParts[+idx];
+  if(!p) return;
+  const occRows = (p.occurrences||[]).map(o => `<tr>
+      <td>${h(o.bag)}</td>
+      <td>${h((o.page_index??0)+1)}</td>
+      <td>${h(o.quantity)}</td>
+    </tr>`).join("");
+  const sub = document.createElement("tr");
+  sub.className = "subrow";
+  sub.dataset.owner = idx;
+  sub.innerHTML = `<td colspan="8"><table class="occTable"><thead><tr><th>Bag</th><th>Page</th><th>Qty</th></tr></thead><tbody>${occRows || '<tr><td colspan="3">No occurrences.</td></tr>'}</tbody></table></td>`;
+  tr.after(sub);
+});
 
 // File input + drag/drop
 document.getElementById("file").addEventListener("change", e=>{
