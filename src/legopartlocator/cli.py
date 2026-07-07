@@ -44,6 +44,29 @@ def _load_extracts(path: str) -> List[PageExtract]:
     return [PageExtract(**d) for d in data]
 
 
+def _tesseract_or_null_ocr():
+    """Return None (use the default TesseractOCR) if the binary is present,
+    else a no-op OCR plus a warning. Quantities default to 1 without it, but
+    bag numbers still work — they're assigned ordinally (see locate.py)."""
+    import shutil
+
+    if shutil.which("tesseract") is not None:
+        return None
+
+    click.echo(
+        "Tesseract binary not found: quantities default to 1. Bag numbers are "
+        "still assigned (ordinally, from detected bag-start pages). Install "
+        "Tesseract to read quantities and any printed part ids.",
+        err=True,
+    )
+
+    class _NullOCR:
+        def read_text(self, image_bgr):
+            return ""
+
+    return _NullOCR()
+
+
 @click.group()
 @click.version_option(__version__, prog_name="lpl")
 def main() -> None:
@@ -68,6 +91,8 @@ def main() -> None:
 @click.option("--locale", default="en-gb", show_default=True, help="LEGO site locale for auto-download (e.g. en-us, de-de).")
 @click.option("--booklet", type=int, default=1, show_default=True, help="Which booklet to scan when a set has several.")
 @click.option("--download-dir", default=".", show_default=True, help="Where to save auto-downloaded PDFs.")
+@click.option("--panel-low", type=int, default=None, help="[local engine] Override DetectConfig.panel_gray_low (callout background band).")
+@click.option("--panel-high", type=int, default=None, help="[local engine] Override DetectConfig.panel_gray_high.")
 @click.option("--extracts", type=click.Path(exists=True, dir_okay=False), default=None,
               help="Load pre-extracted page JSON instead of running the vision pass.")
 @click.option("--out", "out_dir", default="out", show_default=True, help="Output directory.")
@@ -89,6 +114,8 @@ def scan(
     locale: str,
     booklet: int,
     download_dir: str,
+    panel_low: Optional[int],
+    panel_high: Optional[int],
     extracts: Optional[str],
     out_dir: str,
     cache_dir: str,
@@ -110,7 +137,8 @@ def scan(
         if not pdf:
             raise click.UsageError("--engine local requires a PDF path or --set to auto-download.")
         _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
-                   no_brickognize, embeddings, no_rebrickable, out_dir)
+                   no_brickognize, embeddings, no_rebrickable, out_dir,
+                   cache_dir, no_cache, panel_low, panel_high)
         return
 
     if not pdf and not extracts:
@@ -174,6 +202,47 @@ def scan(
     click.echo("Open web/index.html and load result.json to search.")
 
 
+@main.command()
+@click.argument("pdf", type=click.Path(exists=True, dir_okay=False))
+@click.option("--out", "out_dir", default="out/debug", show_default=True, help="Directory for overlay PNGs + stats.json.")
+@click.option("--pages", "page_spec", default=None, help="1-based page range, e.g. '1-10'.")
+@click.option("--dpi", type=int, default=180, show_default=True, help="Render DPI.")
+@click.option("--panel-low", type=int, default=None, help="Override DetectConfig.panel_gray_low.")
+@click.option("--panel-high", type=int, default=None, help="Override DetectConfig.panel_gray_high.")
+def debug(pdf: str, out_dir: str, page_spec: Optional[str], dpi: int,
+          panel_low: Optional[int], panel_high: Optional[int]) -> None:
+    """Visualise local (--engine local) detection on a PDF to tune thresholds.
+
+    Writes page_NNN.png (detected callout/bag boxes overlaid), mask_NNN.png
+    (the gray-band threshold mask), and stats.json (per-page counts and the
+    area-fraction/aspect numbers DetectConfig's gates are tuned against).
+    """
+    try:
+        from .debug_overlay import run_debug
+        from .vision_local import DetectConfig
+    except ImportError as exc:
+        raise click.UsageError(
+            f"The debug command needs the optional dependencies ({exc.name} is missing). "
+            'Install them with:  pip install -e ".[local]"'
+        )
+
+    config = DetectConfig()
+    if panel_low is not None:
+        config.panel_gray_low = panel_low
+    if panel_high is not None:
+        config.panel_gray_high = panel_high
+
+    ocr = _tesseract_or_null_ocr()
+
+    click.echo(f"Detecting on {pdf} at {dpi} DPI -> {out_dir} ...")
+    stats = run_debug(pdf, out_dir, dpi=dpi, page_spec=page_spec, config=config, ocr=ocr)
+    n_pages = len(stats.get("pages", []))
+    total_callouts = sum(p.get("n_callouts", 0) for p in stats.get("pages", []))
+    click.echo(f"Wrote {n_pages} page(s) of overlays/masks + stats.json to {out_dir}.")
+    click.echo(f"Total callouts detected: {total_callouts}.")
+    click.echo("Open the page_*.png files to see what was caught; tune --panel-low/--panel-high from mask_*.png.")
+
+
 def _render_and_extract(pdf, page_spec, max_pages, dpi, triage_dpi, single_pass, cache_dir, no_cache):
     from .pdf_render import PageRenderer, parse_page_range, page_count, render_pages
     from .vision import VisionExtractor, extract_pages, extract_pages_two_pass
@@ -235,7 +304,8 @@ def _autofetch_pdf(set_num, locale, booklet, download_dir):
 
 
 def _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
-               no_brickognize, embeddings, no_rebrickable, out_dir):
+               no_brickognize, embeddings, no_rebrickable, out_dir,
+               cache_dir, no_cache, panel_low, panel_high):
     """Local engine: detect callouts with OpenCV, identify with the free ensemble."""
     from .brickognize import BrickognizeClient
     from .inventory import load_inventory_file
@@ -267,7 +337,10 @@ def _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
     elif set_num and not no_rebrickable:
         inventory, set_name = _fetch_inventory(set_num)
 
-    brickognize = None if no_brickognize else BrickognizeClient()
+    brickognize = None
+    if not no_brickognize:
+        bk_cache = None if no_cache else JSONCache(Path(cache_dir))
+        brickognize = BrickognizeClient(cache=bk_cache)
     gallery = None  # set below only when embeddings are enabled with an inventory
 
     if not inventory:
@@ -302,24 +375,16 @@ def _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
         )
         reconcile_counts = True
 
-    # OCR (quantities + bag numerals) needs the Tesseract binary; degrade if absent.
-    import shutil
+    from .vision_local import DetectConfig, LocalDetector
 
-    from .vision_local import LocalDetector
+    config = DetectConfig()
+    if panel_low is not None:
+        config.panel_gray_low = panel_low
+    if panel_high is not None:
+        config.panel_gray_high = panel_high
 
-    detector = None
-    if shutil.which("tesseract") is None:
-        click.echo(
-            "Tesseract binary not found: quantities default to 1 and bag numbers "
-            "won't be read. Install Tesseract for full local accuracy.",
-            err=True,
-        )
-
-        class _NullOCR:
-            def read_text(self, image_bgr):
-                return ""
-
-        detector = LocalDetector(ocr=_NullOCR())
+    ocr = _tesseract_or_null_ocr()
+    detector = LocalDetector(config=config, ocr=ocr) if (ocr or panel_low or panel_high) else None
 
     signals = ["colour"]
     if brickognize:

@@ -138,38 +138,70 @@ PDF -> vision_local (OpenCV: callout crops + bag numerals + quantity OCR)
 ```
 
 Run it with `lpl scan instructions.pdf --engine local --inventory-file inv.csv`
-(see Usage). It needs the `[local]` extra (`pip install -e ".[local]"`) and the
-**Tesseract binary** for reading quantities/bag numbers — without Tesseract it
-still runs but quantities default to 1 and bag numbers aren't read. `--embeddings`
-additionally turns on the image-matcher (needs the `[ml]` extra + network to
-fetch reference images).
+(see Usage). It needs the `[local]` extra (`pip install -e ".[local]"`). The
+**Tesseract binary** is optional: without it, quantities default to 1, but
+**bag numbers still work** — real LEGO bags are always numbered 1..N in page
+order, so a detected bag-start page with no readable digit is assigned the next
+number ordinally (no OCR needed). Install Tesseract to also read quantities and
+any printed part/element ids. `--embeddings` additionally turns on the
+image-matcher (needs the `[ml]` extra + network to fetch reference images).
 
-> **Status:** fully wired and unit-tested (blending, NN, inventory, detection
-> mechanics, and the `assemble_result` orchestrator). The one thing that still
-> needs a real instruction page is **tuning the OpenCV `DetectConfig`
-> thresholds** (gray band, cell-area gates) — they're calibrated to the standard
-> callout style but real DPI/print variation will want adjustment.
+Brickognize calls are cached (by crop-image hash, reusing `--cache-dir`/
+`--no-cache`) and retried with backoff, so a re-scan or a flaky connection
+doesn't re-pay for or crash on every callout; one failed identify no longer
+aborts the whole scan — it's logged as a warning and that callout falls into
+the "unidentified" bucket.
+
+### Calibrating detection on a real page
+
+The OpenCV thresholds (`DetectConfig`: gray band, cell-area/aspect gates) are
+calibrated to the standard LEGO callout style but real DPI/print variation may
+need adjustment. `lpl debug` visualises exactly what the detector caught:
+
+```bash
+lpl debug instructions.pdf --out out/debug --pages 1-10
+```
+
+This writes, per page: `page_NNN.png` (detected callout boxes + bag marker
+overlaid), `mask_NNN.png` (the gray-band threshold mask — the fastest way to
+see if `panel_gray_low`/`panel_gray_high` need adjusting), and `stats.json`
+(per-page counts and the area-fraction/aspect numbers the `DetectConfig` gates
+are tuned against). Override the band with `--panel-low`/`--panel-high` (also
+available on `lpl scan --engine local`) once you know what to change.
 
 ## Development
 
 ```bash
-pytest         # offline unit tests: bag segmentation + reconciliation
+pytest         # offline unit tests (92): bags, reconcile, local engine, identify, etc.
 ```
+
+CI (`.github/workflows/ci.yml`) runs the suite on Ubuntu (3.11, 3.12) and
+Windows (3.12) on every push/PR — no network, keys, or Tesseract needed.
 
 ## Layout
 
 ```
 src/legopartlocator/
-  cli.py         # `lpl scan` entrypoint
-  pdf_render.py  # PyMuPDF: page -> PNG, text, cover set-number detection
-  vision.py      # Claude vision, schema-forced extraction + caching
-  bags.py        # marker -> page->bag step-function segmentation
-  rebrickable.py # inventory client
-  reconcile.py   # callout <-> inventory matching + count validation
-  aggregate.py   # ScanResult -> JSON/CSV
-  models.py      # pydantic schemas
-  cache.py       # page-hash JSON cache
-web/index.html   # static searchable viewer
+  cli.py           # `lpl scan` / `lpl debug` entrypoints
+  pdf_render.py    # PyMuPDF: page -> PNG, text, cover set-number detection
+  vision.py        # Claude vision engine: schema-forced extraction + caching
+  vision_local.py  # OpenCV local engine: callout/bag detection, quantity OCR
+  detection.py     # PageDetection/DetectedCallout contract (crop bytes + bbox)
+  debug_overlay.py # visualise local detection: overlays, mask, per-page stats
+  identify.py      # ensemble part identifier (Brickognize + embedding + colour)
+  brickognize.py   # free part-ID API client (cached, retried, throttled)
+  embedding.py      # cosine-NN gallery over inventory reference images
+  colors.py         # LEGO colour table + dominant-colour extraction
+  inventory.py      # local CSV/JSON inventory loader (no API key)
+  fetcher.py        # auto-download instruction PDFs from lego.com by set number
+  locate.py         # local-engine orchestration: detect -> identify -> ScanResult
+  bags.py           # marker -> page->bag step-function segmentation
+  rebrickable.py    # inventory client
+  reconcile.py      # callout <-> inventory matching + count validation (claude engine)
+  aggregate.py      # ScanResult -> JSON/CSV
+  models.py         # pydantic schemas
+  cache.py          # page/crop-hash JSON cache
+web/index.html      # static searchable viewer (warnings, bag cards, occurrences)
 ```
 
 ## Notes & limits

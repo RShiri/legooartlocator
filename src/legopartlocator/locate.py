@@ -187,8 +187,17 @@ def locate_local(
         if progress:
             progress(i + 1, len(indices))
 
-    return assemble_result(
+    # Fill in bag numbers that the detector spotted structurally but couldn't
+    # OCR (no Tesseract binary, or an unreadable glyph) — real bags are always
+    # numbered 1..N in page order, so this needs no digit reading at all.
+    from .vision_local import assign_ordinal_bag_numbers
+
+    ordinal_warnings = assign_ordinal_bag_numbers(detections)
+
+    result = assemble_result(
         detections, inventory, identifier, total,
         use_color=use_color, reconcile_counts=reconcile_counts,
         source_pdf=str(pdf_path), set_num=set_num, set_name=set_name,
     )
+    result.warnings.extend(ordinal_warnings)
+    return result
