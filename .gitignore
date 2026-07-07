@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.env
+.venv/
+venv/
+
+# Working artifacts
+.lpl_cache/
+*.pdf
+!samples/*.pdf
+out/
+result.json
+result.csv

@@ -1,0 +1,151 @@
+{
+  "set_num": null,
+  "set_name": null,
+  "source_pdf": null,
+  "num_pages": 6,
+  "reconciled": false,
+  "bags": [
+    {
+      "bag": 0,
+      "start_page": 0,
+      "end_page": 0
+    },
+    {
+      "bag": 1,
+      "start_page": 1,
+      "end_page": 2
+    },
+    {
+      "bag": 2,
+      "start_page": 3,
+      "end_page": 5
+    }
+  ],
+  "parts": [
+    {
+      "key": "vision:bluish gray light|1 2 plate x",
+      "name": "1 x 2 plate",
+      "part_num": null,
+      "color_name": "light bluish gray",
+      "element_id": null,
+      "image_url": null,
+      "occurrences": [
+        {
+          "bag": 1,
+          "page_index": 2,
+          "quantity": 4
+        },
+        {
+          "bag": 2,
+          "page_index": 4,
+          "quantity": 4
+        }
+      ],
+      "bags": [
+        1,
+        2
+      ],
+      "pages": [
+        2,
+        4
+      ],
+      "total_seen": 8,
+      "inventory_qty": null,
+      "reconciled": false,
+      "count_matches": null,
+      "confidence": 0.4
+    },
+    {
+      "key": "vision:red|2 4 brick x",
+      "name": "2 x 4 brick",
+      "part_num": null,
+      "color_name": "red",
+      "element_id": null,
+      "image_url": null,
+      "occurrences": [
+        {
+          "bag": 1,
+          "page_index": 1,
+          "quantity": 2
+        },
+        {
+          "bag": 1,
+          "page_index": 2,
+          "quantity": 2
+        }
+      ],
+      "bags": [
+        1
+      ],
+      "pages": [
+        1,
+        2
+      ],
+      "total_seen": 4,
+      "inventory_qty": null,
+      "reconciled": false,
+      "count_matches": null,
+      "confidence": 0.4
+    },
+    {
+      "key": "vision:black|2 4 plate x",
+      "name": "2 x 4 plate",
+      "part_num": null,
+      "color_name": "black",
+      "element_id": null,
+      "image_url": null,
+      "occurrences": [
+        {
+          "bag": 1,
+          "page_index": 1,
+          "quantity": 1
+        },
+        {
+          "bag": 2,
+          "page_index": 3,
+          "quantity": 1
+        }
+      ],
+      "bags": [
+        1,
+        2
+      ],
+      "pages": [
+        1,
+        3
+      ],
+      "total_seen": 2,
+      "inventory_qty": null,
+      "reconciled": false,
+      "count_matches": null,
+      "confidence": 0.4
+    },
+    {
+      "key": "vision:yellow|1 plate round x",
+      "name": "1 x 1 round plate",
+      "part_num": null,
+      "color_name": "yellow",
+      "element_id": null,
+      "image_url": null,
+      "occurrences": [
+        {
+          "bag": 2,
+          "page_index": 3,
+          "quantity": 2
+        }
+      ],
+      "bags": [
+        2
+      ],
+      "pages": [
+        3
+      ],
+      "total_seen": 2,
+      "inventory_qty": null,
+      "reconciled": false,
+      "count_matches": null,
+      "confidence": 0.4
+    }
+  ],
+  "warnings": []
+}
