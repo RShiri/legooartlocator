@@ -103,6 +103,37 @@ def render_pages(
             yield RenderedPage(page_index=idx, png_bytes=png, text=text)
 
 
+class PageRenderer:
+    """Keeps a PDF open so individual pages can be rendered on demand.
+
+    Used by the two-pass flow to render only the pages that need the detailed
+    (high-DPI) pass, without reopening the document per page.
+    """
+
+    def __init__(self, pdf_path: str | Path, dpi: int = 200):
+        self.doc = open_pdf(pdf_path)
+        zoom = dpi / 72.0
+        self._matrix = fitz.Matrix(zoom, zoom)
+
+    def render(self, page_index: int) -> RenderedPage:
+        page = self.doc.load_page(page_index)
+        pix = page.get_pixmap(matrix=self._matrix, alpha=False)
+        return RenderedPage(
+            page_index=page_index,
+            png_bytes=pix.tobytes("png"),
+            text=page.get_text("text") or "",
+        )
+
+    def close(self) -> None:
+        self.doc.close()
+
+    def __enter__(self) -> "PageRenderer":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
 def detect_set_number(pdf_path: str | Path, scan_pages: int = 4) -> Optional[str]:
     """Best-effort set-number detection from the first/last pages' text layer.
 

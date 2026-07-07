@@ -55,7 +55,9 @@ def main() -> None:
 @click.option("--set", "set_num", default=None, help="LEGO set number (e.g. 76307). Auto-detected if omitted.")
 @click.option("--pages", "page_spec", default=None, help="1-based page range, e.g. '1-40,55'.")
 @click.option("--max-pages", type=int, default=None, help="Cap number of pages scanned (dev/cost control).")
-@click.option("--dpi", type=int, default=150, show_default=True, help="Render DPI for the vision pass.")
+@click.option("--dpi", type=int, default=180, show_default=True, help="Render DPI for the detailed vision pass.")
+@click.option("--triage-dpi", type=int, default=110, show_default=True, help="Render DPI for the cheap triage pass.")
+@click.option("--single-pass", is_flag=True, help="Disable two-pass; run the detailed model on every page.")
 @click.option("--no-rebrickable", is_flag=True, help="Skip Rebrickable reconciliation (vision-only).")
 @click.option("--extracts", type=click.Path(exists=True, dir_okay=False), default=None,
               help="Load pre-extracted page JSON instead of running the vision pass.")
@@ -68,6 +70,8 @@ def scan(
     page_spec: Optional[str],
     max_pages: Optional[int],
     dpi: int,
+    triage_dpi: int,
+    single_pass: bool,
     no_rebrickable: bool,
     extracts: Optional[str],
     out_dir: str,
@@ -87,7 +91,7 @@ def scan(
         click.echo(f"Loaded {len(page_extracts)} page extracts from {extracts}.")
     else:
         page_extracts, num_pages = _render_and_extract(
-            pdf, page_spec, max_pages, dpi, cache_dir, no_cache
+            pdf, page_spec, max_pages, dpi, triage_dpi, single_pass, cache_dir, no_cache
         )
 
     # 2. Resolve set number (needed for reconciliation).
@@ -136,26 +140,40 @@ def scan(
     click.echo("Open web/index.html and load result.json to search.")
 
 
-def _render_and_extract(pdf, page_spec, max_pages, dpi, cache_dir, no_cache):
-    from .pdf_render import parse_page_range, page_count, render_pages
-    from .vision import VisionExtractor, extract_pages
+def _render_and_extract(pdf, page_spec, max_pages, dpi, triage_dpi, single_pass, cache_dir, no_cache):
+    from .pdf_render import PageRenderer, parse_page_range, page_count, render_pages
+    from .vision import VisionExtractor, extract_pages, extract_pages_two_pass
 
     total = page_count(pdf)
     indices = parse_page_range(page_spec, total)
     if max_pages is not None:
         indices = indices[:max_pages]
-    click.echo(f"Rendering {len(indices)}/{total} pages at {dpi} DPI...")
-
-    rendered = list(render_pages(pdf, dpi=dpi, page_indices=indices))
     extractor = VisionExtractor(cache=JSONCache(Path(cache_dir)))
 
     def progress(done, tot):
-        click.echo(f"  vision {done}/{tot}", nl=False)
-        click.echo("\r", nl=False)
+        click.echo(f"  vision {done}/{tot}   \r", nl=False)
 
-    click.echo("Running vision extraction...")
-    page_extracts = extract_pages(rendered, extractor, use_cache=not no_cache, progress=progress)
+    if single_pass:
+        click.echo(f"Single-pass: rendering {len(indices)}/{total} pages at {dpi} DPI...")
+        rendered = list(render_pages(pdf, dpi=dpi, page_indices=indices))
+        page_extracts = extract_pages(rendered, extractor, use_cache=not no_cache, progress=progress)
+        click.echo("")
+        return page_extracts, total
+
+    # Two-pass: cheap triage over all pages, detailed read only where needed.
+    click.echo(f"Pass 1/2 (triage): rendering {len(indices)}/{total} pages at {triage_dpi} DPI...")
+    triage_renders = list(render_pages(pdf, dpi=triage_dpi, page_indices=indices))
+    click.echo("Pass 2/2 (detail): reading callouts on flagged pages...")
+    with PageRenderer(pdf, dpi=dpi) as detail_renderer:
+        page_extracts, stats = extract_pages_two_pass(
+            triage_renders, detail_renderer.render, extractor,
+            use_cache=not no_cache, progress=progress,
+        )
     click.echo("")
+    click.echo(
+        f"Two-pass: triaged {stats['triaged']} pages, detailed {stats['detailed']}, "
+        f"skipped {stats['skipped']} (no callouts)."
+    )
     return page_extracts, total
 
 

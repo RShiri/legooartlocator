@@ -10,10 +10,13 @@ the printed instructions — so the PDF has to be scanned.
 A hybrid pipeline:
 
 1. **Render** — each PDF page is rasterised to an image (PyMuPDF).
-2. **Vision** — Claude's vision model reads each page into structured JSON:
-   bag markers, parts callouts (quantity + colour + shape + any printed id),
-   and whether the page is a parts-list (BOM). Output is schema-forced (no
-   text parsing) and cached per page-image hash, so re-runs are free.
+2. **Vision (two-pass)** — a cheap **triage** pass (fast model, low DPI)
+   classifies every page: bag marker? BOM? any callouts to read? Then a
+   **detailed** pass (capable model, high DPI) reads callouts only on the pages
+   triage flagged — covers, story, "completed", and BOM pages skip the
+   expensive pass entirely. Output is schema-forced (no text parsing) and cached
+   per page-image hash, so re-runs are free. Use `--single-pass` to run the
+   detailed model on every page instead.
 3. **Segment** — sparse bag markers become a dense `page → bag` map (bag
    membership is a step function over page order).
 4. **Reconcile** — the set's canonical inventory is pulled from Rebrickable and
@@ -43,6 +46,10 @@ lpl scan instructions.pdf --no-rebrickable
 
 # Cost control while developing
 lpl scan instructions.pdf --pages 1-40 --max-pages 20 --dpi 120
+
+# Two-pass is on by default; tune it or turn it off
+lpl scan instructions.pdf --triage-dpi 110 --dpi 180   # default two-pass
+lpl scan instructions.pdf --single-pass                # detailed model on every page
 ```
 
 Then open `web/index.html` and drop in `out/result.json` (or serve the folder
@@ -89,9 +96,10 @@ web/index.html   # static searchable viewer
 
 ## Notes & limits
 
-- **Cost** scales with page count; caching + `--pages`/`--max-pages` keep it in
-  check. A two-pass optimisation (cheap marker/callout detection first, detailed
-  extraction only on callout pages) is a natural next step.
+- **Cost** scales with page count. The two-pass flow (cheap triage over all
+  pages, detailed reads only where needed) plus per-page caching and
+  `--pages`/`--max-pages` keep it in check. Models are configurable via
+  `ANTHROPIC_MODEL` (detail) and `ANTHROPIC_TRIAGE_MODEL` (triage).
 - **Part identification** from small renders is inherently fuzzy. Reconciliation
   against the known inventory + count validation is what makes results
   trustworthy; the `confidence` field and count-mismatch warnings tell you where
