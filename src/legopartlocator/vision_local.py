@@ -100,7 +100,16 @@ class DetectConfig:
 
     # A bag-start numeral is tall relative to the page; its glyph must reach at
     # least this fraction of the page height. ``bag_marker_dark_max`` is the upper
-    # gray bound for "ink" pixels (the numeral is near-black).
+    # gray bound for "ink" pixels (the numeral is near-black). Tried lowering
+    # this globally to catch a small circled corner badge on a bigger booklet
+    # (76269) but that reintroduced a real regression: 76307's per-step
+    # counter numerals (plain solid digits, ~0.06 of page height) then also
+    # qualified, since a solid digit is a solid digit regardless of size --
+    # nothing else distinguishes "step counter" from "bag marker" for that
+    # style. Kept strict; see ``bag_marker_ring_min_height_frac`` for the
+    # deliberately more permissive floor that applies only to circled digits,
+    # where the ring itself (never used for a step counter) is the signal
+    # that licenses a smaller size.
     bag_marker_min_height_frac: float = 0.12
     bag_marker_dark_max: int = 90
 
@@ -127,6 +136,37 @@ class DetectConfig:
     # chunky studded-brick closeup) on real false positives from the same
     # instruction booklet, against ~0.46-0.62 for rendered bold digits 0-9.
     bag_marker_min_fill_frac: float = 0.42
+
+    # Some booklets print the bag/booklet marker as a digit inside a circle
+    # (a ring), not a solid filled glyph -- measured fill ~0.32 on a real
+    # circled "2" (76269), below ``bag_marker_min_fill_frac``. A candidate in
+    # this lower band is only accepted if it's also very simple (a ring plus
+    # a digit is 2 external contours), since low-fill *and* multi-part shapes
+    # are exactly the illustration noise the fill gate exists to reject (e.g.
+    # a studded-brick closeup: fill ~0.36, 3 external contours).
+    bag_marker_ring_min_fill_frac: float = 0.28
+    bag_marker_ring_max_components: int = 2
+    # A ring is a separate ink blob from the digit it encloses, so a real
+    # circled digit is *at least* 2 disconnected components -- a lone solid
+    # digit (no ring) is always exactly 1. Without this floor, an ordinary
+    # small step-counter digit (high fill, 1 component) also satisfied the
+    # ring branch's fill/max-components checks and was wrongly accepted.
+    bag_marker_ring_min_components: int = 2
+    # A ring's own bbox spans nearly the whole merged candidate (the digit is
+    # nested inside it), so the largest component covers most of the merged
+    # area -- measured ~0.87 on a real ring. A two-digit number like "20" also
+    # has exactly 2 disconnected blobs (satisfying the component-count check
+    # above) but neither digit dominates -- side-by-side, ~0.44-0.46 each on
+    # a real merged "20". This is what actually tells the two cases apart.
+    bag_marker_ring_min_dominant_frac: float = 0.65
+
+    # The ring branch also gets a lower height floor than
+    # ``bag_marker_min_height_frac`` -- a circled digit is never how a
+    # per-step counter is printed, so the ring shape itself licenses a
+    # smaller marker (measured ~0.07 of page height on 76269's real corner
+    # badge) without reopening the door to small solid-digit step counters
+    # (76307), which only ever pass the *solid* branch.
+    bag_marker_ring_min_height_frac: float = 0.05
 
     # A real digit (or a merged multi-digit run) is one or two simple strokes,
     # so its near-black mask breaks into only a couple of contours. Busy
@@ -284,18 +324,20 @@ class LocalDetector:
         callouts = self._detect_callouts(img, cell_boxes)
         is_parts_list = len(callouts) >= self.config.bom_cell_count
 
-        if is_parts_list:
-            # A page dense enough to look like a contents/BOM/cover grid is not
-            # a genuine bag-start page -- covers in particular often contain a
-            # large dark product render whose bounding box can otherwise pass
-            # the bag-marker size gates. Skip bag-marker detection entirely so
-            # such a page can never be mistaken for "bag N" (which would
-            # corrupt ordinal numbering, since it's usually page 1).
-            bag_marker, bag_marker_candidate, bag_marker_bbox = None, False, None
-        else:
-            bag_marker, bag_marker_candidate, bag_marker_bbox = self._detect_bag_marker(
-                gray, img, cell_boxes
-            )
+        # A dense contents/BOM/cover page used to have bag-marker detection
+        # skipped outright here, since a large dark product render could pass
+        # the (then-only) size gates and get mistaken for "bag N" -- corrupting
+        # ordinal numbering, since such a page is usually page 1. That blunt
+        # rule turned out to also suppress *real* bag/booklet markers on
+        # bigger sets, where the cover is itself busy enough to trip
+        # ``is_parts_list`` on illustration noise (e.g. a building render's
+        # window panes) while still carrying a real corner marker. The gates
+        # added since (saturation, aspect, fill, component-count) reject the
+        # original dark-product-render case directly -- confirmed against the
+        # real page that motivated the blunt rule -- so it's no longer needed.
+        bag_marker, bag_marker_candidate, bag_marker_bbox = self._detect_bag_marker(
+            gray, img, cell_boxes
+        )
 
         return PageDetection(
             page_index=page_index,
@@ -429,7 +471,10 @@ class LocalDetector:
         """
         cfg = self.config
         height, width = gray.shape[:2]
-        min_h = cfg.bag_marker_min_height_frac * height
+        # The more permissive of the two height floors, so a ring candidate
+        # isn't discarded before it even reaches the branch decision below
+        # (which re-applies the stricter, branch-specific floor).
+        min_h = min(cfg.bag_marker_min_height_frac, cfg.bag_marker_ring_min_height_frac) * height
 
         mask = cv2.inRange(gray, 0, cfg.bag_marker_dark_max)
         boxes: List[Tuple[int, int, int, int]] = []
@@ -499,12 +544,27 @@ class LocalDetector:
             if region_mask.size == 0:
                 continue
             fill_frac = float((region_mask > 0).mean())
-            if fill_frac < cfg.bag_marker_min_fill_frac:
+            n_components = len(_find_contours(region_mask))
+            is_solid_digit = (
+                fill_frac >= cfg.bag_marker_min_fill_frac
+                and h >= cfg.bag_marker_min_height_frac * height
+            )
+            is_ring_digit = False
+            if (
+                fill_frac >= cfg.bag_marker_ring_min_fill_frac
+                and cfg.bag_marker_ring_min_components
+                <= n_components
+                <= cfg.bag_marker_ring_max_components
+                and h >= cfg.bag_marker_ring_min_height_frac * height
+            ):
+                component_boxes = [cv2.boundingRect(c) for c in _find_contours(region_mask)]
+                dominant_frac = max((cw * ch) / (w * h) for _, _, cw, ch in component_boxes)
+                is_ring_digit = dominant_frac >= cfg.bag_marker_ring_min_dominant_frac
+            if not (is_solid_digit or is_ring_digit):
                 continue
             region_sat = saturation[y : y + h, x : x + w][region_mask > 0]
             if region_sat.size and region_sat.mean() > cfg.bag_marker_max_saturation:
                 continue
-            n_components = len(_find_contours(region_mask))
             if n_components > cfg.bag_marker_max_components:
                 continue
             kept.append(b)

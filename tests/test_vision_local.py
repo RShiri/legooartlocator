@@ -259,6 +259,58 @@ def test_large_illustration_outline_is_not_bag_marker_candidate():
     assert result.bag_marker_bbox is None
 
 
+def _draw_ringed_bag_numeral(
+    page: np.ndarray, cx: int = 400, cy: int = 500, radius: int = 45,
+    ring_thickness: int = 8, digit_w: int = 20, digit_h: int = 30,
+) -> None:
+    """A digit inside a circle, standing in for a "circled N" bag/booklet
+    marker style (found on real set 76269, smaller than a full page-dominating
+    numeral -- see ``bag_marker_ring_min_height_frac``).
+
+    Drawn as a near-complete ellipse (a small gap left open) rather than a
+    mathematically perfect closed circle: a perfectly sealed loop makes the
+    nested digit topologically a "hole-within-a-hole" that OpenCV's
+    ``RETR_EXTERNAL`` silently drops, which the real scanned image (with
+    anti-aliasing) never quite is -- it measurably yields 2 external contours
+    (ring + digit; see the real-page measurement in HANDOFF.md). The gap
+    reproduces that same 2-contour result without depending on rasteriser
+    anti-aliasing specifics.
+    """
+    cv2.ellipse(page, (cx, cy), (radius, radius), 0, 0, 340, BLACK, thickness=ring_thickness)
+    x0, y0 = cx - digit_w // 2, cy - digit_h // 2
+    cv2.rectangle(page, (x0, y0), (x0 + digit_w, y0 + digit_h), BLACK, thickness=-1)
+
+
+def test_small_circled_digit_is_bag_marker_candidate():
+    """Regression: 76269's real bag/booklet marker is a small digit inside a
+    circle (~0.07 of page height), too small for the plain solid-digit height
+    gate but licensed by the ring shape itself -- a per-step counter is never
+    circled. Below ``bag_marker_min_height_frac`` (0.12) but above the ring
+    branch's own floor (0.05)."""
+    page = _blank_page()
+    _draw_ringed_bag_numeral(page, radius=45)  # ~98px tall on a 1000px page (~0.10)
+
+    result = LocalDetector(ocr=FakeOCR(bag_text="")).detect_page(page, page_index=0)
+    assert result.bag_marker is None
+    assert result.bag_marker_candidate is True
+    assert result.bag_marker_bbox is not None
+
+
+def test_small_two_digit_number_is_not_bag_marker_candidate():
+    """A small two-digit step-counter number (e.g. "11") also breaks into 2
+    disconnected ink blobs like a ring+digit does, but the two digits split
+    the merged bbox roughly evenly -- neither one dominates the way a ring
+    (which spans the whole merged box) does. Must not be mistaken for a
+    circled marker just because it's below the solid-digit height gate."""
+    page = _blank_page()
+    _draw_two_digit_bag_numeral(page, x=380, y=450, w1=25, gap=8, w2=25, h=90)
+
+    result = LocalDetector(ocr=FakeOCR(bag_text="")).detect_page(page, page_index=0)
+    assert result.bag_marker is None
+    assert result.bag_marker_candidate is False
+    assert result.bag_marker_bbox is None
+
+
 def test_dark_saturated_part_render_is_not_bag_marker_candidate():
     """Regression: a dark but *coloured* part render (e.g. maroon Iron Man
     armor) can be just as dark in grayscale as a printed numeral, but real
@@ -322,23 +374,40 @@ def test_textured_pattern_is_not_bag_marker_candidate():
     assert result.bag_marker_bbox is None
 
 
-def test_bag_marker_suppressed_on_parts_list_page():
+def test_colour_render_on_dense_cover_page_is_not_bag_marker_candidate():
     """Regression: a cover/contents page (real 76307 booklet page 1) has both
     lots of small graphic elements (logos/badges -- misread as callout cells,
     tripping is_parts_list) AND a dark product-render silhouette sized enough
-    to otherwise pass the bag-marker gates. Such a dense page must never also
-    report a bag-marker candidate, or ordinal numbering treats page 1 as
-    "Bag 1" and every real bag shifts by one."""
+    to otherwise pass the bag-marker size/aspect gates. The real render is
+    *coloured* (e.g. Iron Man's dark-red armor), so it's the saturation gate
+    -- not a blanket "never detect on a dense page" rule -- that must reject
+    it; a blanket rule also suppressed real bag/booklet markers on bigger,
+    busier covers (76269), so it was removed once the finer-grained gates
+    (saturation, aspect, fill, components) were confirmed to cover this case
+    on the actual real page that motivated it (see HANDOFF.md)."""
     page = _page_with_cells(20)  # trips is_parts_list (default bom_cell_count=12)
-    # A moderately large dark blob, sized like the real cover's character
-    # render (comfortably inside the bag-marker area/width gates).
-    cv2.rectangle(page, (300, 300), (500, 500), BLACK, thickness=-1)
+    dark_red_bgr = (20, 20, 120)  # low grayscale value, high HSV saturation
+    cv2.rectangle(page, (300, 300), (500, 500), dark_red_bgr, thickness=-1)
 
     result = LocalDetector(ocr=FakeOCR()).detect_page(page, page_index=0)
     assert result.is_parts_list is True
     assert result.bag_marker is None
     assert result.bag_marker_candidate is False
     assert result.bag_marker_bbox is None
+
+
+def test_bag_marker_still_detected_on_dense_cover_page():
+    """A dense/BOM-like page can still carry a real bag/booklet marker (found
+    on 76269's booklet-1 cover: a small circled digit in the corner, with the
+    rest of the page's "callouts" being false positives from window panes in
+    a building render). is_parts_list must not blanket-suppress it."""
+    page = _page_with_cells(20)  # trips is_parts_list
+    _draw_bag_numeral(page, x=650, y=500, w=100, h=150)  # clear of the cell grid
+    ocr = FakeOCR(bag_text="2", big_height=100)
+
+    result = LocalDetector(ocr=ocr).detect_page(page, page_index=0)
+    assert result.is_parts_list is True
+    assert result.bag_marker == 2
 
 
 def test_assign_ordinal_bag_numbers_fills_candidates_in_page_order():
