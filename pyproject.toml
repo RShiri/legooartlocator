@@ -21,6 +21,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# Local page detection (callout/bag/quantity) — no paid API. Needs the Tesseract
+# binary installed separately for OCR.
+local = ["opencv-python-headless>=4.8", "pytesseract>=0.3.10", "pillow>=10.0"]
 # Heavy, optional: local image-embedding part matcher (no paid API).
 ml = ["torch>=2.0", "open-clip-torch>=2.20", "pillow>=10.0"]
 
