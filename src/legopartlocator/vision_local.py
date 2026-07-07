@@ -82,6 +82,15 @@ class DetectConfig:
     bag_marker_min_height_frac: float = 0.12
     bag_marker_dark_max: int = 90
 
+    # Upper bounds so large dark artwork (illustration outlines, shaded panels)
+    # isn't mistaken for a numeral: a real bag-start glyph is a small graphic
+    # element, not a large fraction of the page's area or width. Found by
+    # inspecting a real instruction page where a "shake the bag" illustration's
+    # thick circle outline (tall, near-black, but ~half the page) was wrongly
+    # flagged as a bag-marker candidate.
+    bag_marker_max_area_frac: float = 0.10
+    bag_marker_max_width_frac: float = 0.35
+
 
 @runtime_checkable
 class OCR(Protocol):
@@ -312,7 +321,7 @@ class LocalDetector:
         ever invoked. Returns merged bboxes sorted by area, largest first.
         """
         cfg = self.config
-        height = gray.shape[0]
+        height, width = gray.shape[:2]
         min_h = cfg.bag_marker_min_height_frac * height
 
         mask = cv2.inRange(gray, 0, cfg.bag_marker_dark_max)
@@ -355,6 +364,14 @@ class LocalDetector:
             x1 = max(b[0] + b[2] for b in group)
             y1 = max(b[1] + b[3] for b in group)
             merged.append((x0, y0, x1 - x0, y1 - y0))
+
+        # Reject shapes too large/wide to be a numeral: illustration outlines and
+        # shaded panels are also tall and near-black, but a real bag-start glyph
+        # is a small graphic element, not a large fraction of the page.
+        page_area = float(height * width)
+        max_area = cfg.bag_marker_max_area_frac * page_area
+        max_w = cfg.bag_marker_max_width_frac * width
+        merged = [b for b in merged if (b[2] * b[3]) <= max_area and b[2] <= max_w]
 
         merged.sort(key=lambda b: b[2] * b[3], reverse=True)
         return merged

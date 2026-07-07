@@ -217,6 +217,20 @@ def test_dark_blob_inside_callout_cell_is_not_bag_marker_candidate():
     assert result.bag_marker_bbox is None
 
 
+def test_large_illustration_outline_is_not_bag_marker_candidate():
+    """Regression: a thick circular illustration outline (e.g. a "shake the bag
+    out" panel) is tall and near-black like a numeral, but far too large in
+    area/width to be one. Found on a real instruction page where the whole
+    illustration was wrongly flagged as a bag-marker candidate."""
+    page = _blank_page()
+    cv2.circle(page, (PAGE_W // 2, PAGE_H // 2), 300, BLACK, thickness=15)
+
+    result = LocalDetector(ocr=FakeOCR()).detect_page(page, page_index=3)
+    assert result.bag_marker is None
+    assert result.bag_marker_candidate is False
+    assert result.bag_marker_bbox is None
+
+
 def test_assign_ordinal_bag_numbers_fills_candidates_in_page_order():
     detections = [
         PageDetection(page_index=0, bag_marker_candidate=True),
