@@ -143,3 +143,36 @@ class PartIdentifier:
             components=components,
             alternatives=alternatives,
         )
+
+
+class BrickognizeOnlyIdentifier:
+    """Unconstrained identifier: returns the top Brickognize candidate directly.
+
+    Used when no set inventory is available — the zero-account path. Lower
+    precision than the inventory-constrained ensemble (no closed-set filtering,
+    no colour disambiguation of the same part across colours), but needs nothing
+    but the free Brickognize service.
+    """
+
+    def __init__(self, brickognize: BrickognizeClient, top_k: int = 5):
+        self.brickognize = brickognize
+        self.top_k = top_k
+
+    @staticmethod
+    def _to_part(cand, color: Optional[str] = None) -> InventoryPart:
+        return InventoryPart(
+            part_num=cand.part_num, name=cand.name, quantity=0,
+            color_name=color, image_url=cand.img_url,
+        )
+
+    def identify(self, crop_bytes: bytes, seen_color: Optional[str] = None) -> IdentificationResult:
+        cands = self.brickognize.predict(crop_bytes)
+        if not cands:
+            return IdentificationResult(part=None, confidence=0.0)
+        top = cands[0]
+        return IdentificationResult(
+            part=self._to_part(top, seen_color),
+            confidence=max(0.0, top.score),
+            components={"brickognize": top.score},
+            alternatives=[(self._to_part(c), c.score) for c in cands[1 : self.top_k]],
+        )

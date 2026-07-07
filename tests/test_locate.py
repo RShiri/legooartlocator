@@ -86,6 +86,19 @@ def test_unidentified_callouts_are_grouped_and_warned():
     assert any("could not be identified" in w for w in result.warnings)
 
 
+def test_unconstrained_mode_keeps_parts_without_count_check():
+    inv = _inv()
+    detections = [PageDetection(page_index=0, bag_marker=1, callouts=[_callout(1, b"red")])]
+    ident = FakeIdentifier(inv, {b"red": (0, 0.9)})
+    result = assemble_result(detections, inv, ident, num_pages=1, use_color=False, reconcile_counts=False)
+    red = next(p for p in result.parts if p.part_num == "3001")
+    assert red.reconciled is False
+    assert red.inventory_qty is None
+    assert red.count_matches is None            # no count validation
+    assert result.reconciled is False
+    assert not any("mismatch" in w for w in result.warnings)
+
+
 def test_parts_list_page_is_skipped():
     inv = _inv()
     detections = [

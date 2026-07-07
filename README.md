@@ -37,7 +37,16 @@ pip install -e ".[dev]"
 
 ## Usage
 
+You can pass a local PDF, **or just a set number** — with `--set NNNN` and no PDF
+path the tool auto-downloads the official instructions from lego.com (scrapes the
+building-instructions page, grabs the CDN PDF link, downloads it). For sets with
+several booklets, pick one with `--booklet N`; change region with `--locale en-us`.
+
 ```bash
+# Auto-download the PDF for a set, then scan it
+lpl scan --set 76307 --engine local          # zero-account: auto-fetch + Brickognize
+lpl scan --set 76307                          # paid vision engine (needs ANTHROPIC_API_KEY)
+
 # Full pipeline (needs ANTHROPIC_API_KEY; REBRICKABLE_API_KEY enables reconcile)
 lpl scan path/to/instructions.pdf --set 76307 --out out
 
@@ -52,7 +61,8 @@ lpl scan instructions.pdf --triage-dpi 110 --dpi 180   # default two-pass
 lpl scan instructions.pdf --single-pass                # detailed model on every page
 
 # Fully local engine — no paid API (OpenCV detect + Brickognize/embedding ID)
-lpl scan instructions.pdf --engine local --set 76307              # inventory via Rebrickable key
+lpl scan --set 76307 --engine local                              # zero accounts (Brickognize only)
+lpl scan instructions.pdf --engine local --set 76307             # inventory via Rebrickable key
 lpl scan instructions.pdf --engine local --inventory-file inv.csv # inventory from a free export, no key
 lpl scan instructions.pdf --engine local --inventory-file inv.csv --embeddings  # add local image matching
 ```

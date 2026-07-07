@@ -51,6 +51,7 @@ def assemble_result(
     num_pages: int,
     *,
     use_color: bool = True,
+    reconcile_counts: bool = True,
     source_pdf: Optional[str] = None,
     set_num: Optional[str] = None,
     set_name: Optional[str] = None,
@@ -59,6 +60,9 @@ def assemble_result(
 
     Pure and side-effect free: ``identifier`` is injected, so this is tested with
     synthetic detections and a fake identifier (no OpenCV/torch/network).
+
+    When ``reconcile_counts`` is False (no canonical inventory, e.g. the
+    Brickognize-only path), identified parts are kept but not count-validated.
     """
     page_extracts = [d.to_page_extract() for d in detections]
     segments, warnings = segment_bags(page_extracts, num_pages)
@@ -90,7 +94,9 @@ def assemble_result(
                     lp = LocatedPart(
                         key=key, name=p.name, part_num=p.part_num,
                         color_name=p.color_name, element_id=p.element_id,
-                        image_url=p.image_url, inventory_qty=p.quantity, reconciled=True,
+                        image_url=p.image_url,
+                        inventory_qty=p.quantity if reconcile_counts else None,
+                        reconciled=reconcile_counts,
                     )
                     by_key[key] = lp
                     conf_acc[key] = []
@@ -130,7 +136,7 @@ def assemble_result(
     parts = sorted(by_key.values(), key=lambda p: (p.bags[0] if p.bags else 0, p.name or p.key))
     return ScanResult(
         set_num=set_num, set_name=set_name, source_pdf=source_pdf,
-        num_pages=num_pages, reconciled=True, bags=segments, parts=parts, warnings=warnings,
+        num_pages=num_pages, reconciled=reconcile_counts, bags=segments, parts=parts, warnings=warnings,
     )
 
 
@@ -144,6 +150,7 @@ def locate_local(
     max_pages: Optional[int] = None,
     detector=None,
     use_color: bool = True,
+    reconcile_counts: bool = True,
     set_num: Optional[str] = None,
     set_name: Optional[str] = None,
     progress=None,
@@ -166,5 +173,6 @@ def locate_local(
 
     return assemble_result(
         detections, inventory, identifier, total,
-        use_color=use_color, source_pdf=str(pdf_path), set_num=set_num, set_name=set_name,
+        use_color=use_color, reconcile_counts=reconcile_counts,
+        source_pdf=str(pdf_path), set_num=set_num, set_name=set_name,
     )

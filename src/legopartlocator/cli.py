@@ -65,6 +65,9 @@ def main() -> None:
               help="Local set inventory CSV/JSON (BrickLink/Rebrickable export). Enables the local engine with no key.")
 @click.option("--no-brickognize", is_flag=True, help="[local engine] Disable the Brickognize signal.")
 @click.option("--embeddings", is_flag=True, help="[local engine] Enable embedding retrieval (needs the [ml] extra + network).")
+@click.option("--locale", default="en-gb", show_default=True, help="LEGO site locale for auto-download (e.g. en-us, de-de).")
+@click.option("--booklet", type=int, default=1, show_default=True, help="Which booklet to scan when a set has several.")
+@click.option("--download-dir", default=".", show_default=True, help="Where to save auto-downloaded PDFs.")
 @click.option("--extracts", type=click.Path(exists=True, dir_okay=False), default=None,
               help="Load pre-extracted page JSON instead of running the vision pass.")
 @click.option("--out", "out_dir", default="out", show_default=True, help="Output directory.")
@@ -83,24 +86,37 @@ def scan(
     inventory_file: Optional[str],
     no_brickognize: bool,
     embeddings: bool,
+    locale: str,
+    booklet: int,
+    download_dir: str,
     extracts: Optional[str],
     out_dir: str,
     cache_dir: str,
     no_cache: bool,
 ) -> None:
-    """Scan a LEGO instruction PDF and write result.json / result.csv."""
+    """Scan a LEGO instruction PDF and write result.json / result.csv.
+
+    Give a PDF path, or just --set NNNN to auto-download the instructions from
+    lego.com, or --extracts for offline mode.
+    """
     _load_dotenv()
+
+    # Auto-download the PDF from lego.com when only a set number was given.
+    if not pdf and not extracts and set_num:
+        pdf = _autofetch_pdf(set_num, locale, booklet, download_dir)
 
     # Local engine: OpenCV detection + Brickognize/embedding identification (no paid API).
     if engine == "local":
         if not pdf:
-            raise click.UsageError("--engine local requires a PDF path.")
+            raise click.UsageError("--engine local requires a PDF path or --set to auto-download.")
         _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
                    no_brickognize, embeddings, no_rebrickable, out_dir)
         return
 
     if not pdf and not extracts:
-        raise click.UsageError("Provide a PDF path, or --extracts for offline mode.")
+        raise click.UsageError(
+            "Provide a PDF path, or --set NNNN to auto-download it, or --extracts for offline mode."
+        )
 
     # 1. Page extracts: either from a file (offline) or via render + vision.
     if extracts:
@@ -195,6 +211,29 @@ def _render_and_extract(pdf, page_spec, max_pages, dpi, triage_dpi, single_pass,
     return page_extracts, total
 
 
+def _autofetch_pdf(set_num, locale, booklet, download_dir):
+    """Download the set's instruction PDF from lego.com and return the chosen booklet's path."""
+    from .fetcher import FetchError, InstructionFetcher, page_url
+
+    click.echo(f"No PDF given — fetching instructions for set {set_num} from {page_url(set_num, locale)} ...")
+    try:
+        paths = InstructionFetcher().fetch(set_num, dest_dir=download_dir, locale=locale)
+    except FetchError as exc:
+        raise click.UsageError(str(exc))
+    except Exception as exc:  # network/HTTP errors
+        raise click.UsageError(f"Failed to fetch instructions for set {set_num}: {exc}")
+
+    if booklet < 1 or booklet > len(paths):
+        raise click.UsageError(f"--booklet {booklet} out of range (set has {len(paths)} booklet(s)).")
+    if len(paths) > 1:
+        listing = ", ".join(f"{i + 1}:{p.name}" for i, p in enumerate(paths))
+        click.echo(f"Found {len(paths)} booklets [{listing}].")
+        click.echo(f"Scanning booklet {booklet}: {paths[booklet - 1].name} (use --booklet N for others).")
+    else:
+        click.echo(f"Downloaded {paths[0].name}.")
+    return str(paths[booklet - 1])
+
+
 def _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
                no_brickognize, embeddings, no_rebrickable, out_dir):
     """Local engine: detect callouts with OpenCV, identify with the free ensemble."""
@@ -209,7 +248,8 @@ def _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
         if set_num:
             click.echo(f"Auto-detected set number: {set_num}")
 
-    # The identifiers are constrained to the inventory, so we must have one.
+    # An inventory lets us constrain identification and reconcile counts; it's
+    # optional — without it we fall back to unconstrained Brickognize-only.
     inventory = None
     set_name = None
     if inventory_file:
@@ -217,32 +257,41 @@ def _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
         click.echo(f"Loaded {len(inventory)} inventory lines from {inventory_file}.")
     elif set_num and not no_rebrickable:
         inventory, set_name = _fetch_inventory(set_num)
-    if not inventory:
-        raise click.UsageError(
-            "The local engine needs the set inventory to constrain identification. "
-            "Provide --inventory-file PATH (a free BrickLink/Rebrickable export), or "
-            "--set NNNN with REBRICKABLE_API_KEY set."
-        )
 
     brickognize = None if no_brickognize else BrickognizeClient()
+    gallery = None  # set below only when embeddings are enabled with an inventory
 
-    gallery = backend = None
-    if embeddings:
-        try:
-            from .embedding import ClipBackend, build_gallery, download_reference_images
+    if not inventory:
+        if brickognize is None:
+            raise click.UsageError(
+                "The local engine needs either a set inventory (--inventory-file PATH, a free "
+                "BrickLink/Rebrickable export; or --set with REBRICKABLE_API_KEY) or Brickognize "
+                "(don't pass --no-brickognize)."
+            )
+        click.echo("No inventory: identifying with Brickognize only (unconstrained, lower precision).")
+        from .identify import BrickognizeOnlyIdentifier
 
-            click.echo("Building embedding gallery (downloading reference images)...")
-            backend = ClipBackend()
-            ref_images = download_reference_images(inventory)
-            gallery = build_gallery(inventory, ref_images, backend)
-            click.echo(f"Gallery: {len(gallery)} parts embedded.")
-        except Exception as exc:  # torch/network/etc. — degrade gracefully
-            click.echo(f"Embeddings disabled ({exc}).", err=True)
-            gallery = backend = None
+        identifier = BrickognizeOnlyIdentifier(brickognize)
+        reconcile_counts = False
+    else:
+        gallery = backend = None
+        if embeddings:
+            try:
+                from .embedding import ClipBackend, build_gallery, download_reference_images
 
-    identifier = make_identifier(
-        inventory, brickognize=brickognize, gallery=gallery, backend=backend, use_color=True
-    )
+                click.echo("Building embedding gallery (downloading reference images)...")
+                backend = ClipBackend()
+                ref_images = download_reference_images(inventory)
+                gallery = build_gallery(inventory, ref_images, backend)
+                click.echo(f"Gallery: {len(gallery)} parts embedded.")
+            except Exception as exc:  # torch/network/etc. — degrade gracefully
+                click.echo(f"Embeddings disabled ({exc}).", err=True)
+                gallery = backend = None
+
+        identifier = make_identifier(
+            inventory, brickognize=brickognize, gallery=gallery, backend=backend, use_color=True
+        )
+        reconcile_counts = True
 
     # OCR (quantities + bag numerals) needs the Tesseract binary; degrade if absent.
     import shutil
@@ -274,8 +323,9 @@ def _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
         click.echo(f"  page {done}/{tot}   \r", nl=False)
 
     result = locate_local(
-        pdf, inventory, identifier, dpi=dpi, page_spec=page_spec, max_pages=max_pages,
-        detector=detector, use_color=True, set_num=set_num, set_name=set_name, progress=progress,
+        pdf, inventory or [], identifier, dpi=dpi, page_spec=page_spec, max_pages=max_pages,
+        detector=detector, use_color=True, reconcile_counts=reconcile_counts,
+        set_num=set_num, set_name=set_name, progress=progress,
     )
     click.echo("")
     paths = write_outputs(result, out_dir)

@@ -4,7 +4,12 @@ import numpy as np
 
 from legopartlocator.brickognize import BrickognizeClient
 from legopartlocator.embedding import EmbeddingBackend, Gallery
-from legopartlocator.identify import PartIdentifier, blend_scores, color_score
+from legopartlocator.identify import (
+    BrickognizeOnlyIdentifier,
+    PartIdentifier,
+    blend_scores,
+    color_score,
+)
 from legopartlocator.models import InventoryPart
 
 
@@ -101,3 +106,26 @@ def test_no_signals_returns_none():
     result = ident.identify(b"crop")
     assert result.part is None
     assert result.confidence == 0.0
+
+
+# --- BrickognizeOnlyIdentifier (zero-inventory path) ----------------------
+
+def test_brickognize_only_returns_top_candidate_unconstrained():
+    # Part 99999 is NOT in any inventory, but the unconstrained identifier keeps it.
+    bk = _fake_brickognize([
+        {"id": "99999", "name": "Rare part", "score": 0.7, "img_url": "http://img/9.png"},
+        {"id": "3001", "name": "Brick 2 x 4", "score": 0.3},
+    ])
+    ident = BrickognizeOnlyIdentifier(bk)
+    result = ident.identify(b"crop", seen_color="red")
+    assert result.part.part_num == "99999"
+    assert result.part.name == "Rare part"
+    assert result.part.color_name == "red"      # seen colour carried through
+    assert result.part.image_url == "http://img/9.png"
+    assert result.confidence == 0.7
+    assert result.alternatives[0][0].part_num == "3001"
+
+
+def test_brickognize_only_none_when_no_candidates():
+    ident = BrickognizeOnlyIdentifier(_fake_brickognize([]))
+    assert ident.identify(b"crop").part is None
