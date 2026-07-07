@@ -129,6 +129,12 @@ class PartIdentifier:
             if cscore:
                 signals["color"] = cscore
 
+        # Colour is corroborative only: without a Brickognize or embedding hit
+        # to anchor the answer, colour alone can't identify a specific part —
+        # it would just pick an arbitrary inventory line of the seen colour.
+        if not signals.get("brickognize") and not signals.get("embedding"):
+            return IdentificationResult(part=None, confidence=0.0)
+
         blended = blend_scores(signals, self.weights)
         if not blended:
             return IdentificationResult(part=None, confidence=0.0)

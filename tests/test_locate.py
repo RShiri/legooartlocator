@@ -31,6 +31,23 @@ class FakeIdentifier:
         return IdentificationResult(part=part, confidence=conf)
 
 
+class FlakyFakeIdentifier:
+    """Like FakeIdentifier, but raises RuntimeError for a chosen set of crop tags
+    (simulating a Brickognize HTTP failure / timeout / 429)."""
+
+    def __init__(self, inventory, mapping, failing_tags):
+        self.inventory = inventory
+        self.mapping = mapping
+        self.failing_tags = set(failing_tags)
+
+    def identify(self, crop_bytes, seen_color=None):
+        if crop_bytes in self.failing_tags:
+            raise RuntimeError(f"boom on {crop_bytes!r}")
+        idx, conf = self.mapping.get(crop_bytes, (None, 0.0))
+        part = self.inventory[idx] if idx is not None else None
+        return IdentificationResult(part=part, confidence=conf)
+
+
 def test_attributes_parts_to_bags_and_reconciles_counts():
     inv = _inv()
     detections = [
@@ -97,6 +114,49 @@ def test_unconstrained_mode_keeps_parts_without_count_check():
     assert red.count_matches is None            # no count validation
     assert result.reconciled is False
     assert not any("mismatch" in w for w in result.warnings)
+
+
+def test_identify_failure_lands_in_unidentified_bucket_and_warns():
+    inv = _inv()
+    detections = [
+        PageDetection(page_index=0, bag_marker=1, callouts=[_callout(2, b"red")]),
+        PageDetection(page_index=1, callouts=[_callout(3, b"boom")]),
+    ]
+    ident = FlakyFakeIdentifier(inv, {b"red": (0, 0.9)}, failing_tags={b"boom"})
+
+    result = assemble_result(detections, inv, ident, num_pages=2, use_color=False)
+
+    # The scan completes and still identifies the parts it could.
+    red = next(p for p in result.parts if p.part_num == "3001")
+    assert red.total_seen == 2
+
+    # The failing callout is bucketed like any other unidentified crop.
+    unknown = [p for p in result.parts if not p.reconciled]
+    assert len(unknown) == 1
+    assert unknown[0].total_seen == 3
+
+    assert any("identify failed on page" in w for w in result.warnings)
+    assert any("page 2" in w for w in result.warnings)
+
+
+def test_identify_failures_are_capped_with_summary_warning():
+    inv = _inv()
+    # 5 pages, each with one callout whose identify() raises.
+    detections = [
+        PageDetection(page_index=i, bag_marker=1, callouts=[_callout(1, f"boom{i}".encode())])
+        for i in range(5)
+    ]
+    failing_tags = {f"boom{i}".encode() for i in range(5)}
+    ident = FlakyFakeIdentifier(inv, {}, failing_tags=failing_tags)
+
+    result = assemble_result(detections, inv, ident, num_pages=5, use_color=False)
+
+    failure_msgs = [w for w in result.warnings if "identify failed on page" in w]
+    assert len(failure_msgs) == 3  # capped at 3 distinct messages
+
+    summary = [w for w in result.warnings if "identify call(s) failed in total" in w]
+    assert len(summary) == 1
+    assert "5" in summary[0]
 
 
 def test_parts_list_page_is_skipped():

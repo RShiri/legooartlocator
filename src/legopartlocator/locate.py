@@ -20,7 +20,7 @@ from .brickognize import BrickognizeClient
 from .colors import crop_color_name, rgb_color_scorer
 from .detection import PageDetection
 from .embedding import EmbeddingBackend, Gallery
-from .identify import PartIdentifier
+from .identify import IdentificationResult, PartIdentifier
 from .models import InventoryPart, LocatedPart, Occurrence, ScanResult
 from .reconcile import _inv_key
 
@@ -71,6 +71,8 @@ def assemble_result(
     by_key: Dict[str, LocatedPart] = {}
     conf_acc: Dict[str, List[float]] = {}
     unidentified = 0
+    identify_failures = 0
+    identify_failure_msgs: List[str] = []
 
     for det in sorted(detections, key=lambda d: d.page_index):
         if det.is_parts_list:
@@ -83,7 +85,14 @@ def assemble_result(
                     seen_color = crop_color_name(dc.crop_png)
                 except Exception:
                     seen_color = None
-            result = identifier.identify(dc.crop_png, seen_color=seen_color)
+            try:
+                result = identifier.identify(dc.crop_png, seen_color=seen_color)
+            except Exception as exc:
+                identify_failures += 1
+                msg = f"identify failed on page {det.page_index + 1}: {exc}"
+                if len(identify_failure_msgs) < 3 and msg not in identify_failure_msgs:
+                    identify_failure_msgs.append(msg)
+                result = IdentificationResult(part=None, confidence=0.0)
             qty = dc.callout.quantity
 
             if result.part is not None:
@@ -129,6 +138,13 @@ def assemble_result(
                     f"Count mismatch for {lp.name or lp.key}: saw {lp.total_seen}, "
                     f"inventory has {lp.inventory_qty}."
                 )
+
+    warnings.extend(identify_failure_msgs)
+    if identify_failures > 3:
+        warnings.append(
+            f"{identify_failures} identify call(s) failed in total "
+            f"(only the first 3 distinct messages are shown above)."
+        )
 
     if unidentified:
         warnings.append(f"{unidentified} callout(s) could not be identified against the inventory.")

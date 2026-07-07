@@ -108,6 +108,30 @@ def test_no_signals_returns_none():
     assert result.confidence == 0.0
 
 
+def test_color_only_never_identifies_a_part():
+    # No brickognize, no gallery: colour is the only signal available. It must
+    # not be enough on its own to name a specific part, even though the
+    # inventory contains a Red line that would otherwise "match" perfectly.
+    ident = PartIdentifier(_inventory())
+    result = ident.identify(b"crop", seen_color="red")
+    assert result.part is None
+    assert result.confidence == 0.0
+
+
+def test_color_does_not_rescue_out_of_inventory_brickognize_hit():
+    # Brickognize is present but only proposes a part_num outside the
+    # inventory; colour agreement alone must not "rescue" a match.
+    inv = _inventory()
+    ident = PartIdentifier(
+        inv,
+        brickognize=_fake_brickognize(
+            [{"id": "99999", "name": "Not in set", "score": 0.99}]
+        ),
+    )
+    result = ident.identify(b"crop", seen_color="red")
+    assert result.part is None
+
+
 # --- BrickognizeOnlyIdentifier (zero-inventory path) ----------------------
 
 def test_brickognize_only_returns_top_candidate_unconstrained():
