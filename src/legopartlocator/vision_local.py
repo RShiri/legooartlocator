@@ -229,9 +229,19 @@ class LocalDetector:
         cell_boxes = self._cell_boxes(gray)
         callouts = self._detect_callouts(img, cell_boxes)
         is_parts_list = len(callouts) >= self.config.bom_cell_count
-        bag_marker, bag_marker_candidate, bag_marker_bbox = self._detect_bag_marker(
-            gray, img, cell_boxes
-        )
+
+        if is_parts_list:
+            # A page dense enough to look like a contents/BOM/cover grid is not
+            # a genuine bag-start page -- covers in particular often contain a
+            # large dark product render whose bounding box can otherwise pass
+            # the bag-marker size gates. Skip bag-marker detection entirely so
+            # such a page can never be mistaken for "bag N" (which would
+            # corrupt ordinal numbering, since it's usually page 1).
+            bag_marker, bag_marker_candidate, bag_marker_bbox = None, False, None
+        else:
+            bag_marker, bag_marker_candidate, bag_marker_bbox = self._detect_bag_marker(
+                gray, img, cell_boxes
+            )
 
         return PageDetection(
             page_index=page_index,

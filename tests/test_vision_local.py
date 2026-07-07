@@ -231,6 +231,25 @@ def test_large_illustration_outline_is_not_bag_marker_candidate():
     assert result.bag_marker_bbox is None
 
 
+def test_bag_marker_suppressed_on_parts_list_page():
+    """Regression: a cover/contents page (real 76307 booklet page 1) has both
+    lots of small graphic elements (logos/badges -- misread as callout cells,
+    tripping is_parts_list) AND a dark product-render silhouette sized enough
+    to otherwise pass the bag-marker gates. Such a dense page must never also
+    report a bag-marker candidate, or ordinal numbering treats page 1 as
+    "Bag 1" and every real bag shifts by one."""
+    page = _page_with_cells(20)  # trips is_parts_list (default bom_cell_count=12)
+    # A moderately large dark blob, sized like the real cover's character
+    # render (comfortably inside the bag-marker area/width gates).
+    cv2.rectangle(page, (300, 300), (500, 500), BLACK, thickness=-1)
+
+    result = LocalDetector(ocr=FakeOCR()).detect_page(page, page_index=0)
+    assert result.is_parts_list is True
+    assert result.bag_marker is None
+    assert result.bag_marker_candidate is False
+    assert result.bag_marker_bbox is None
+
+
 def test_assign_ordinal_bag_numbers_fills_candidates_in_page_order():
     detections = [
         PageDetection(page_index=0, bag_marker_candidate=True),
