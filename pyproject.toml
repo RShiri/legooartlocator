@@ -20,21 +20,29 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
 # Local page detection (callout/bag/quantity) — no paid API. Needs the Tesseract
 # binary installed separately for OCR.
 local = ["opencv-python-headless>=4.8", "pytesseract>=0.3.10", "pillow>=10.0"]
 # Heavy, optional: local image-embedding part matcher (no paid API).
 ml = ["torch>=2.0", "open-clip-torch>=2.20", "pillow>=10.0"]
 # Heavier still: train our own local part-embedding model (`lpl train-embedding`),
-# no paid API. torch-directml gives real GPU acceleration on Windows for
-# non-CUDA cards (AMD/Intel); harmless no-op to install on other platforms
-# where it isn't needed, since training just falls back to CPU/CUDA. Capped
-# to Python <3.13: torch-directml only ships wheels for 3.8-3.12 (checked
-# against PyPI directly) -- on newer interpreters training silently runs on
-# CPU instead, which is why `python_version` is part of the marker and not
-# just `sys_platform`.
-train = ["torch>=2.0", "torchvision>=0.15", "pillow>=10.0", "torch-directml>=0.2; sys_platform == 'win32' and python_version < '3.13'"]
+# no paid API. opencv-python-headless is needed directly here (train/data.py's
+# augmentation pipeline uses cv2), not just transitively via `local` -- listed
+# explicitly so `pip install -e ".[train]"` alone is self-sufficient. torch-directml
+# gives real GPU acceleration on Windows for non-CUDA cards (AMD/Intel); harmless
+# no-op to install on other platforms where it isn't needed, since training just
+# falls back to CPU/CUDA. Capped to Python <3.13: torch-directml only ships wheels
+# for 3.8-3.12 (checked against PyPI directly) -- on newer interpreters training
+# silently runs on CPU instead, which is why `python_version` is part of the
+# marker and not just `sys_platform`.
+train = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "pillow>=10.0",
+    "opencv-python-headless>=4.8",
+    "torch-directml>=0.2; sys_platform == 'win32' and python_version < '3.13'",
+]
 
 [project.scripts]
 lpl = "legopartlocator.cli:main"
@@ -45,3 +53,16 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 140  # matches the codebase's existing longest lines; not a reflow pass
+target-version = "py39"
+
+[tool.ruff.lint]
+# Deliberately basic: real errors (F: unused imports/vars, undefined names)
+# and import hygiene (I). NOT "UP" (pyupgrade) -- its typing.List/Optional[X]
+# -> list/X|None rules alone produced 400+ findings across nearly every file,
+# which would be a large, separate typing-style rewrite, not a lint pass.
+# Not enabling stricter/opinionated rule sets (B, N, D, ANN, ...) either --
+# each is a bigger, separate undertaking, not part of this hardening pass.
+select = ["E", "F", "I"]

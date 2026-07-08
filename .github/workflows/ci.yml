@@ -26,4 +26,20 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
       - run: pip install -e ".[dev,local]"
+      - run: ruff check .
+      - run: python -m pytest -q
+
+  # A separate job (not part of the main matrix, since installing torch is
+  # slow) that actually installs the [train] extra, so TrainedBackend's
+  # contract tests -- importorskip("torch")-skipped in the job above on every
+  # run -- execute for real at least once per CI run instead of never.
+  test-train-extra:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -e ".[dev,local,train]"
       - run: python -m pytest -q

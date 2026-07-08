@@ -139,18 +139,29 @@ PDF -> vision_local (OpenCV: callout crops + bag numerals + quantity OCR)
 
 Run it with `lpl scan instructions.pdf --engine local --inventory-file inv.csv`
 (see Usage). It needs the `[local]` extra (`pip install -e ".[local]"`). The
-**Tesseract binary** is optional: without it, quantities default to 1, but
-**bag numbers still work** — real LEGO bags are always numbered 1..N in page
-order, so a detected bag-start page with no readable digit is assigned the next
-number ordinally (no OCR needed). Install Tesseract to also read quantities and
-any printed part/element ids. `--embeddings` additionally turns on the
-image-matcher (needs the `[ml]` extra + network to fetch reference images).
+**Tesseract binary** is optional: without it, a built-in, dependency-free digit
+reader (`DigitOCR`) still reads each callout's printed "Nx" quantity by digit
+template-matching, and **bag numbers work either way** — real LEGO bags are
+always numbered 1..N in page order, so a detected bag-start page with no
+readable digit is assigned the next number ordinally. Install Tesseract only if
+you also want printed part/element ids read (`DigitOCR` doesn't attempt those).
+`--embeddings` additionally turns on the image-matcher (needs the `[ml]`
+extra + network to fetch reference images).
 
 Brickognize calls are cached (by crop-image hash, reusing `--cache-dir`/
 `--no-cache`) and retried with backoff, so a re-scan or a flaky connection
 doesn't re-pay for or crash on every callout; one failed identify no longer
 aborts the whole scan — it's logged as a warning and that callout falls into
 the "unidentified" bucket.
+
+A few more `--engine local` flags worth knowing about:
+- `--capacity-reconcile` (on by default; `--no-capacity-reconcile` to disable)
+  stops an embedding-only match from over-filling a part past its known
+  inventory quantity — the surplus crop is diverted to its next-best
+  candidate instead of inflating a count-mismatch warning.
+- `--dump-crops DIR` writes every callout crop plus a `manifest.json`
+  (final + raw assignment, per-signal confidence, alternatives) — useful for
+  debugging misidentifications, or as input to `--real-crops` below.
 
 ### Training your own embedding model
 
@@ -178,6 +189,23 @@ offline; the actual torch training loop (`train/embedding_trainer.py`) and
 `embedding.TrainedBackend` need the `[train]` extra to run, same as
 `ClipBackend` already does for `[ml]`.
 
+Tuning knobs worth knowing about (`lpl train-embedding --help` for the full
+list):
+- `--augment-style icon` (default) flattens shading and adds a black edge
+  outline so catalog photos look more like flat instruction-booklet icons;
+  `--augment-style photo` is the original, unmodified pipeline.
+- `--mining semihard` (default) mines hard negatives from the current model
+  each epoch instead of sampling them at random; `--mining random` is the
+  original uniform sampling.
+- `--real-crops MANIFEST` (repeatable) feeds corroborated crops from a prior
+  `scan --dump-crops` back in as real, in-domain training examples.
+- `--ldraw-dir LIBRARY_ROOT` (point it at the `ldraw/` folder from
+  ldraw.org's free `complete.zip`) renders flat-shaded, icon-style training
+  images straight from LDraw's part geometry — the closest structural match
+  to how instruction booklets actually draw parts. `--ldraw-only
+  PART,PART,...` restricts this to specific parts instead of the whole
+  inventory.
+
 ### Calibrating detection on a real page
 
 The OpenCV thresholds (`DetectConfig`: gray band, cell-area/aspect gates) are
@@ -198,11 +226,14 @@ available on `lpl scan --engine local`) once you know what to change.
 ## Development
 
 ```bash
-pytest         # offline unit tests (127, or 124 without the [train] extra installed): bags, reconcile, local engine, identify, training, etc.
+pytest         # offline unit tests: bags, reconcile, local engine, identify, training, etc.
+ruff check .   # lint
 ```
 
 CI (`.github/workflows/ci.yml`) runs the suite on Ubuntu (3.11, 3.12) and
-Windows (3.12) on every push/PR — no network, keys, or Tesseract needed.
+Windows (3.12), plus lint, on every push/PR — no network, keys, or Tesseract
+needed. A separate job installs the `[train]` extra so the torch-dependent
+tests (skipped in the main matrix) run for real at least once per CI run.
 
 ## Layout
 
@@ -217,7 +248,8 @@ src/legopartlocator/
   identify.py      # ensemble part identifier (Brickognize + embedding + colour)
   brickognize.py   # free part-ID API client (cached, retried, throttled)
   embedding.py      # cosine-NN gallery over inventory reference images; ClipBackend/TrainedBackend
-  train/            # `lpl train-embedding`: data augmentation, triplet sampling, training loop
+  train/            # `lpl train-embedding`: augmentation (photo/icon + LDraw renders), triplet sampling/mining, training loop
+  train/ldraw.py    #   from-scratch LDraw .dat parser + flat-shaded icon renderer (no cv2/torch needed to parse/render)
   colors.py         # LEGO colour table + dominant-colour extraction
   inventory.py      # local CSV/JSON inventory loader (no API key)
   fetcher.py        # auto-download instruction PDFs from lego.com by set number
