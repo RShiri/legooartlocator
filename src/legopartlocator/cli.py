@@ -254,25 +254,32 @@ def debug(pdf: str, out_dir: str, page_spec: Optional[str], dpi: int,
 @click.option("--backbone", type=click.Choice(["mobilenet_v3_small", "resnet18"]), default="mobilenet_v3_small",
               show_default=True)
 @click.option("--embedding-dim", type=int, default=256, show_default=True)
-@click.option("--epochs", type=int, default=5, show_default=True)
+@click.option("--epochs", type=int, default=40, show_default=True, help="Max epochs (early stopping usually stops sooner).")
 @click.option("--variants-per-part", type=int, default=8, show_default=True,
               help="Augmented crops generated per reference image.")
 @click.option("--triplets-per-epoch", type=int, default=200, show_default=True)
 @click.option("--batch-size", type=int, default=16, show_default=True)
+@click.option("--val-frac", type=float, default=0.25, show_default=True,
+              help="Fraction of each part's variants held out to measure retrieval accuracy each epoch.")
+@click.option("--patience", type=int, default=6, show_default=True,
+              help="Stop after this many epochs with no val-accuracy improvement; saves the best epoch's checkpoint.")
 @click.option("--seed", type=int, default=0, show_default=True)
 def train_embedding(
     inventory_file: Optional[str], set_num: Optional[str], out_path: str, backbone: str,
     embedding_dim: int, epochs: int, variants_per_part: int, triplets_per_epoch: int,
-    batch_size: int, seed: int,
+    batch_size: int, val_frac: float, patience: int, seed: int,
 ) -> None:
     """Fine-tune a local part-embedding model on a set's reference images.
 
     No paid API involved: pulls one reference photo per part (from an
     inventory file, or --set with a free REBRICKABLE_API_KEY), augments it
     into several synthetic variants, and trains with triplet loss so same-part
-    crops embed close together. The resulting checkpoint is a drop-in
-    replacement for pretrained CLIP: `lpl scan --engine local --embeddings
-    --embedding-weights <out_path>`.
+    crops embed close together. Held-out variants are used to measure
+    retrieval accuracy each epoch and stop early once it stops improving --
+    training loss alone can't tell learning from memorising the augmented
+    training images. The resulting checkpoint is a drop-in replacement for
+    pretrained CLIP: `lpl scan --engine local --embeddings --embedding-weights
+    <out_path>`.
     """
     _load_dotenv()
     try:
@@ -305,16 +312,22 @@ def train_embedding(
     click.echo(f"Augmenting into {variants_per_part} variants per part...")
     dataset = build_augmented_dataset(ref_images, variants_per_part=variants_per_part, seed=seed)
 
-    def progress(epoch, total, loss):
-        click.echo(f"  epoch {epoch + 1}/{total}: loss={loss:.4f}")
+    def progress(epoch, total, loss, val_accuracy):
+        if val_accuracy is None:
+            click.echo(f"  epoch {epoch + 1}/{total}: loss={loss:.4f}")
+        else:
+            click.echo(f"  epoch {epoch + 1}/{total}: loss={loss:.4f} val_accuracy={val_accuracy:.3f}")
 
-    click.echo(f"Training ({backbone}, {epochs} epochs, {triplets_per_epoch} triplets/epoch)...")
+    click.echo(f"Training ({backbone}, up to {epochs} epochs, {triplets_per_epoch} triplets/epoch, "
+               f"patience={patience})...")
     result = train_embedding_model(
         dataset, out_path, backbone=backbone, embedding_dim=embedding_dim, epochs=epochs,
-        triplets_per_epoch=triplets_per_epoch, batch_size=batch_size, seed=seed,
-        progress_callback=progress,
+        triplets_per_epoch=triplets_per_epoch, batch_size=batch_size, val_frac=val_frac,
+        patience=patience, seed=seed, progress_callback=progress,
     )
-    click.echo(f"\nWrote {result.out_path} (final loss {result.final_loss:.4f}, "
+    acc_msg = f"{result.best_val_accuracy:.3f}" if result.best_val_accuracy is not None else "n/a (too little data for a val split)"
+    click.echo(f"\nWrote {result.out_path} (ran {result.epochs_run} epoch(s), best epoch {result.best_epoch + 1}, "
+               f"best val_accuracy={acc_msg}, final loss {result.final_loss:.4f}, "
                f"{result.n_parts} parts, {result.n_triplets_seen} triplets seen).")
 
 

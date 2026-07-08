@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Sequence
 
+from .data import train_val_split
 from .sampling import flatten_dataset, sample_triplets
 
 CHECKPOINT_FORMAT_VERSION = 1
@@ -29,8 +30,10 @@ CHECKPOINT_FORMAT_VERSION = 1
 @dataclass
 class TrainingResult:
     out_path: Path
-    epochs: int
+    epochs_run: int
+    best_epoch: int
     final_loss: float
+    best_val_accuracy: Optional[float]
     n_parts: int
     n_triplets_seen: int
 
@@ -90,26 +93,93 @@ def _decode_to_tensor(transform, image_bytes: bytes):  # pragma: no cover - requ
     return transform(pil)
 
 
+def _embed_crops(torch, model, crops, device, transform, batch_size=32):  # pragma: no cover - requires torch
+    """L2-normalised embeddings for a flat list of crop bytes, batched."""
+    import torch.nn.functional as F
+
+    out = []
+    for start in range(0, len(crops), batch_size):
+        batch = crops[start : start + batch_size]
+        tensors = torch.stack([_decode_to_tensor(transform, c) for c in batch]).to(device)
+        with torch.no_grad():
+            out.append(F.normalize(model(tensors), p=2, dim=-1))
+    return torch.cat(out, dim=0) if out else torch.zeros((0, 0))
+
+
+def evaluate_retrieval_accuracy(
+    torch, model, train_dataset: Dict[str, Sequence[bytes]], val_dataset: Dict[str, Sequence[bytes]],
+    device, transform,
+) -> Optional[float]:  # pragma: no cover - requires torch
+    """Top-1 retrieval accuracy: embed every val crop, find its nearest
+    neighbour among *all* train crops (across every part, not just its own),
+    check the retrieved part_num matches. This is the thing that actually
+    matters for a retrieval model -- does a different view of an already-seen
+    part still retrieve correctly -- as opposed to training loss, which only
+    says the model separates the specific triplets it was shown.
+
+    Returns ``None`` if there's nothing to evaluate (empty val set).
+    """
+    was_training = model.training
+    model.eval()
+    try:
+        gallery_parts = []
+        gallery_crops = []
+        for part_num, crops in train_dataset.items():
+            gallery_parts.extend([part_num] * len(crops))
+            gallery_crops.extend(crops)
+        val_parts = []
+        val_crops = []
+        for part_num, crops in val_dataset.items():
+            val_parts.extend([part_num] * len(crops))
+            val_crops.extend(crops)
+        if not gallery_crops or not val_crops:
+            return None
+
+        gallery = _embed_crops(torch, model, gallery_crops, device, transform)
+        queries = _embed_crops(torch, model, val_crops, device, transform)
+        sims = queries @ gallery.T
+        nearest = sims.argmax(dim=1).cpu().tolist()
+        correct = sum(1 for i, idx in enumerate(nearest) if gallery_parts[idx] == val_parts[i])
+        return correct / len(val_parts)
+    finally:
+        if was_training:
+            model.train()
+
+
 def train_embedding_model(
     dataset: Dict[str, Sequence[bytes]],
     out_path: str,
     *,
     backbone: str = "mobilenet_v3_small",
     embedding_dim: int = 256,
-    epochs: int = 5,
+    epochs: int = 40,
     triplets_per_epoch: int = 200,
     batch_size: int = 16,
     margin: float = 0.3,
     lr: float = 1e-4,
     seed: int = 0,
+    val_frac: float = 0.25,
+    patience: int = 6,
     device_override: Optional[str] = None,
     progress_callback=None,
 ) -> TrainingResult:  # pragma: no cover - requires torch
-    """Fine-tune ``backbone`` with triplet loss on an augmented dataset.
+    """Fine-tune ``backbone`` with triplet loss on an augmented dataset, with
+    validation-based early stopping.
 
     ``dataset`` is ``{part_num: [augmented crop bytes, ...]}`` -- see
-    ``train.data.build_augmented_dataset``. Saves a checkpoint to
-    ``out_path`` loadable by ``embedding.TrainedBackend``.
+    ``train.data.build_augmented_dataset``. Each part's variants are split
+    into train/val (``train.data.train_val_split``); triplets are sampled
+    only from train, and after every epoch retrieval accuracy is measured on
+    the held-out val crops (``evaluate_retrieval_accuracy``). Training loss
+    alone can't tell "learned to generalise" from "memorised the augmented
+    training images" -- val accuracy is what actually answers that. Stops
+    after ``patience`` epochs with no val-accuracy improvement and saves the
+    *best* checkpoint seen, not necessarily the last epoch's. If there's too
+    little data to hold out a val set at all, falls back to training the
+    full ``epochs`` and saving the final state (a warning-worthy but valid
+    degraded mode, e.g. for a very small inventory).
+
+    Saves a checkpoint to ``out_path`` loadable by ``embedding.TrainedBackend``.
     """
     try:
         import torch
@@ -124,10 +194,13 @@ def train_embedding_model(
     model.train()
 
     transform = _preprocess_transform()
-    flat = flatten_dataset(dataset)
-    # Pre-decode every crop once; the datasets this trains on are small
-    # enough (augmented reference images for one set's inventory) to fit in
-    # memory as tensors.
+    train_dataset, val_dataset = train_val_split(dataset, val_frac=val_frac, seed=seed)
+    has_val = any(val_dataset.values())
+
+    flat = flatten_dataset(train_dataset)
+    # Pre-decode every training crop once; the datasets this trains on are
+    # small enough (augmented reference images for one set's inventory) to
+    # fit in memory as tensors.
     tensors = [_decode_to_tensor(transform, crop) for _part_num, crop in flat]
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -135,8 +208,15 @@ def train_embedding_model(
 
     final_loss = 0.0
     n_triplets_seen = 0
+    best_val_accuracy: Optional[float] = None
+    best_epoch = -1
+    best_state_dict = None
+    epochs_without_improvement = 0
+    epochs_run = 0
+
     for epoch in range(epochs):
-        triplets = sample_triplets(dataset, n=triplets_per_epoch, seed=seed * 1_000_003 + epoch)
+        epochs_run = epoch + 1
+        triplets = sample_triplets(train_dataset, n=triplets_per_epoch, seed=seed * 1_000_003 + epoch)
         epoch_loss = 0.0
         n_batches = 0
         for start in range(0, len(triplets), batch_size):
@@ -160,8 +240,30 @@ def train_embedding_model(
             n_triplets_seen += len(batch)
 
         final_loss = epoch_loss / max(1, n_batches)
+
+        val_accuracy = None
+        if has_val:
+            val_accuracy = evaluate_retrieval_accuracy(
+                torch, model, train_dataset, val_dataset, device, transform
+            )
+
         if progress_callback is not None:
-            progress_callback(epoch, epochs, final_loss)
+            progress_callback(epoch, epochs, final_loss, val_accuracy)
+
+        if not has_val:
+            continue  # no early-stopping signal available; train the full budget
+
+        if best_val_accuracy is None or val_accuracy > best_val_accuracy:
+            best_val_accuracy = val_accuracy
+            best_epoch = epoch
+            best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= patience:
+                break
+
+    final_state_dict = best_state_dict if best_state_dict is not None else model.state_dict()
 
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -170,14 +272,16 @@ def train_embedding_model(
             "format_version": CHECKPOINT_FORMAT_VERSION,
             "backbone": backbone,
             "embedding_dim": embedding_dim,
-            "state_dict": model.cpu().state_dict(),
+            "state_dict": {k: v.cpu() for k, v in final_state_dict.items()},
         },
         out,
     )
     return TrainingResult(
         out_path=out,
-        epochs=epochs,
+        epochs_run=epochs_run,
+        best_epoch=best_epoch if best_state_dict is not None else epochs_run - 1,
         final_loss=final_loss,
+        best_val_accuracy=best_val_accuracy,
         n_parts=len(dataset),
         n_triplets_seen=n_triplets_seen,
     )

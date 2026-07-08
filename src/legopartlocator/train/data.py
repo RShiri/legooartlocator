@@ -137,3 +137,32 @@ def build_augmented_dataset(
     for i, (part_num, image) in enumerate(sorted(ref_images.items())):
         dataset[part_num] = augment(image, variants_per_part, seed=seed * 1_000_003 + i)
     return dataset
+
+
+def train_val_split(
+    dataset: Dict[str, List[bytes]], val_frac: float = 0.25, seed: int = 0, min_train: int = 2
+) -> "tuple[Dict[str, List[bytes]], Dict[str, List[bytes]]]":
+    """Split each part's augmented variants into a train and a held-out val set.
+
+    A part-level split (holding out whole parts) doesn't evaluate the thing
+    that actually matters for a retrieval model: whether a *different* view
+    of an already-seen part still retrieves correctly. So this splits within
+    each part's own variant list instead. ``min_train`` variants are always
+    kept for training (a part needs >= 2 to form any triplet at all); any
+    part with too few variants to also hold out is skipped from validation
+    entirely (still fully used for training).
+    """
+    train: Dict[str, List[bytes]] = {}
+    val: Dict[str, List[bytes]] = {}
+    for part_num in sorted(dataset):
+        variants = list(dataset[part_num])
+        rng = random.Random(f"{seed}:{part_num}")
+        rng.shuffle(variants)
+        n_val = int(len(variants) * val_frac)
+        n_val = min(n_val, len(variants) - min_train)
+        if n_val <= 0:
+            train[part_num] = variants
+            continue
+        val[part_num] = variants[:n_val]
+        train[part_num] = variants[n_val:]
+    return train, val

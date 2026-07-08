@@ -29,8 +29,12 @@ ml = ["torch>=2.0", "open-clip-torch>=2.20", "pillow>=10.0"]
 # Heavier still: train our own local part-embedding model (`lpl train-embedding`),
 # no paid API. torch-directml gives real GPU acceleration on Windows for
 # non-CUDA cards (AMD/Intel); harmless no-op to install on other platforms
-# where it isn't needed, since training just falls back to CPU/CUDA.
-train = ["torch>=2.0", "torchvision>=0.15", "pillow>=10.0", "torch-directml>=0.2; sys_platform == 'win32'"]
+# where it isn't needed, since training just falls back to CPU/CUDA. Capped
+# to Python <3.13: torch-directml only ships wheels for 3.8-3.12 (checked
+# against PyPI directly) -- on newer interpreters training silently runs on
+# CPU instead, which is why `python_version` is part of the marker and not
+# just `sys_platform`.
+train = ["torch>=2.0", "torchvision>=0.15", "pillow>=10.0", "torch-directml>=0.2; sys_platform == 'win32' and python_version < '3.13'"]
 
 [project.scripts]
 lpl = "legopartlocator.cli:main"
