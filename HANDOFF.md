@@ -7,8 +7,9 @@ for how the tool itself works.
 ## Where things stand
 
 **Repo:** `RShiri/legooartlocator` — branch `claude/lego-pdf-part-scanner-lc3aiu`
-**Last commit:** `31c9b41`
-**Tests:** 127 passing, all offline (`pytest`) — torch **is** installed now (`[train]`
+**Last commit:** the three-improvement round — icon augmentation, semi-hard
+mining, capacity-reconcile — see "Update — three improvements shipped" below.
+**Tests:** 142 passing, all offline (`pytest`) — torch **is** installed now (`[train]`
 extra), so the 3 previously-skipped `TrainedBackend` contract tests run for real.
 **User's environment:** Windows, Python venv at `.venv`, `run.bat` wrapper
 (`run scan ...` / `run debug ...`), no Tesseract binary installed. AMD Radeon
@@ -342,29 +343,60 @@ part — a first-principles ML result, not a code-review guess):
    original plan and never attempted — a much bigger undertaking: needs a
    renderer, not just more `pip install`s).
 
+## Update — three improvements shipped, the training trade-off is resolved
+
+The trade-off documented above ("net coverage gain but ~2x the count-mismatch
+warnings") has been **resolved**, not just re-analysed. Three flag-gated
+improvements were added, measured on 76307 (self-consistent — the no-embeddings
+baseline reproduced the documented 31/12 exactly), and are **now the defaults**:
+
+| Config | Identified /47 | Count-mismatch warnings |
+| --- | --- | --- |
+| Baseline (no embeddings) | 31 | 12 |
+| Prior trained (photo aug, random mining) | 36 | 22 |
+| icon aug + semi-hard mining (no reconcile) | 36 | 18 |
+| **+ capacity-reconcile (shipped default)** | **37** | **11** |
+
+1. **Capacity/trust-aware reconciliation** — `locate.py` `assemble_result`
+   (`_resolve_assignments`), CLI `--capacity-reconcile` (default **on**). An
+   embedding-only match (Brickognize didn't corroborate) can no longer fill a
+   part past its inventory quantity; the surplus "attractor" crops divert to
+   their best alternative or to unidentified. A Brickognize-corroborated match
+   is never diverted. Biggest lever on the warning count; no retrain; a no-op
+   when embeddings are off (so the baseline is unchanged).
+2. **Domain-matching "icon" augmentation** — `train/data.py` (`_edge_outline`),
+   CLI `--augment-style icon` (default). Always-flatten + a black Canny edge
+   outline so catalog photos read like flat instruction-booklet icons.
+3. **Semi-hard negative mining** — `train/sampling.py`
+   (`sample_triplets_semihard`, numpy-only, unit-tested) + `embedding_trainer.py`
+   (`mining="semihard"`), CLI `--mining semihard` (default). Negatives are mined
+   from the current model each epoch; loss now descends 0.22 → 0.005 over 22
+   epochs with val 98.8% (vs. the old random path's instant collapse to ~0.04).
+
+Net vs. the prior trained model: **+1 coverage (37 vs 36) and half the warnings
+(11 vs 22)**. Net vs. baseline: **+6 coverage (37 vs 31) with fewer warnings
+than even the no-embedding baseline (11 vs 12)** — no regression on either axis.
+Every improvement is opt-out via its flag (`--no-capacity-reconcile`,
+`--augment-style photo`, `--mining random`) to reproduce the old behaviour.
+Kept checkpoint: `models/lego_embed_76307_v4.pt` (gitignored; regenerate with
+`run train-embedding --set 76307`).
+
+Honest caveats: still one set (76307); 37/47 isn't full coverage (the ~10
+hardest parts stay domain-gap-bound); part of the warning drop is the
+identifier correctly *declining* to place crops it can't corroborate. Not yet
+validated with embeddings on 76269 (the 5202-part gallery/training cost wasn't
+paid).
+
 ## Immediate next step
 
-1. **Training's real conclusion needs a decision, not more blind iteration**
-   (see "Then: user said ... train the model" above for the full evidence):
-   trained embeddings are a net improvement on identified-part coverage
-   (31→36/47, zero regressions) but roughly double the count-mismatch
-   warnings, confirmed to be a domain-gap issue (validated to 96.7% on
-   held-out augmented data, no corresponding improvement on real crops) —
-   not something more epochs fixes. Options, roughly in effort order:
-   - Ship as-is / make it opt-in (`--embeddings --embedding-weights` is
-     already off by default) and let the user decide per-scan whether
-     coverage or count-accuracy matters more.
-   - Try `--val-frac`/`--patience`/`--variants-per-part` tuning for
-     marginal gains (cheap, but the domain-gap ceiling won't move much).
-   - Pursue real domain-matching training data — LDraw synthetic rendering
-     (flagged as a stretch goal from the start, never attempted; needs a
-     3D renderer, real engineering effort) or hand-labelled real crops
-     from actual scans (needs a labelled dataset that doesn't exist yet).
-   - Investigate whether raising `identify.py`'s `DEFAULT_WEIGHTS` isn't
-     the right lever at all, and instead the *count-reconciliation* step
-     (`reconcile.py`/`aggregate.py`) should treat embedding-only matches
-     (no brickognize agreement) with lower trust — not attempted this
-     session, a plausible different angle on the same symptom.
+1. **[RESOLVED — shipped this session]** The training trade-off decision is
+   made: see "Update — three improvements shipped" above. icon augmentation,
+   semi-hard mining, and capacity-reconcile are the defaults; 76307 is now
+   37/47 identified with 11 warnings (from the 31/12 baseline and the prior
+   trained 36/22). The remaining open lever for *coverage* (not counts) is
+   still real domain-matching data — LDraw synthetic rendering or hand-labelled
+   real crops — untouched, and the only thing left that can move the domain-gap
+   ceiling.
 2. **12 residual bag-marker false positives on 76269** (~2% of 644 pages) —
    not yet individually diagnosed the way 76307's were; same general
    "illustration element happens to look digit-shaped" class.

@@ -21,8 +21,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Sequence
 
+import numpy as np
+
 from .data import train_val_split
-from .sampling import flatten_dataset, sample_triplets
+from .sampling import flatten_dataset, sample_triplets, sample_triplets_semihard
 
 CHECKPOINT_FORMAT_VERSION = 1
 
@@ -106,6 +108,26 @@ def _embed_crops(torch, model, crops, device, transform, batch_size=32):  # prag
     return torch.cat(out, dim=0) if out else torch.zeros((0, 0))
 
 
+def _embed_tensors(torch, model, tensors, device, batch_size=32):  # pragma: no cover - requires torch
+    """L2-normalised embeddings for pre-decoded tensors, returned as a numpy
+    array. Runs in eval mode with grads off -- used to mine hard negatives at
+    the start of each epoch -- and restores the model's training mode after."""
+    import torch.nn.functional as F
+
+    was_training = model.training
+    model.eval()
+    out = []
+    try:
+        for start in range(0, len(tensors), batch_size):
+            batch = torch.stack(tensors[start : start + batch_size]).to(device)
+            with torch.no_grad():
+                out.append(F.normalize(model(batch), p=2, dim=-1).cpu())
+    finally:
+        if was_training:
+            model.train()
+    return torch.cat(out, dim=0).numpy() if out else np.zeros((0, 0), dtype=np.float32)
+
+
 def evaluate_retrieval_accuracy(
     torch, model, train_dataset: Dict[str, Sequence[bytes]], val_dataset: Dict[str, Sequence[bytes]],
     device, transform,
@@ -156,6 +178,7 @@ def train_embedding_model(
     triplets_per_epoch: int = 200,
     batch_size: int = 16,
     margin: float = 0.3,
+    mining: str = "semihard",
     lr: float = 1e-4,
     seed: int = 0,
     val_frac: float = 0.25,
@@ -189,6 +212,9 @@ def train_embedding_model(
             "Training needs the optional ML deps. Install with: pip install -e \".[train]\""
         ) from exc
 
+    if mining not in ("random", "semihard"):
+        raise ValueError(f"mining must be 'random' or 'semihard', got {mining!r}")
+
     device = torch.device(device_override) if device_override else _select_device(torch)
     model = _build_backbone(torch, backbone, embedding_dim).to(device)
     model.train()
@@ -216,7 +242,19 @@ def train_embedding_model(
 
     for epoch in range(epochs):
         epochs_run = epoch + 1
-        triplets = sample_triplets(train_dataset, n=triplets_per_epoch, seed=seed * 1_000_003 + epoch)
+        if mining == "semihard":
+            # Re-embed the training crops with the current model, then mine
+            # informative negatives from that geometry (one extra forward pass
+            # over the dataset per epoch -- the ~2x epoch cost noted in the CLI).
+            current_emb = _embed_tensors(torch, model, tensors, device)
+            triplets = sample_triplets_semihard(
+                train_dataset, current_emb, n=triplets_per_epoch,
+                seed=seed * 1_000_003 + epoch, margin=margin,
+            )
+        else:
+            triplets = sample_triplets(
+                train_dataset, n=triplets_per_epoch, seed=seed * 1_000_003 + epoch
+            )
         epoch_loss = 0.0
         n_batches = 0
         for start in range(0, len(triplets), batch_size):

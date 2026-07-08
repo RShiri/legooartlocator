@@ -90,6 +90,9 @@ def main() -> None:
 @click.option("--embeddings", is_flag=True, help="[local engine] Enable embedding retrieval (needs the [ml] extra + network).")
 @click.option("--embedding-weights", type=click.Path(exists=True, dir_okay=False), default=None,
               help="[local engine] Use a checkpoint from `lpl train-embedding` instead of pretrained CLIP (implies --embeddings).")
+@click.option("--capacity-reconcile/--no-capacity-reconcile", default=True, show_default=True,
+              help="[local engine] Stop an embedding-only match from over-filling a part past its inventory quantity "
+                   "(diverts the attractor's spurious extra crops); reduces count-mismatch warnings.")
 @click.option("--locale", default="en-gb", show_default=True, help="LEGO site locale for auto-download (e.g. en-us, de-de).")
 @click.option("--booklet", type=int, default=1, show_default=True, help="Which booklet to scan when a set has several.")
 @click.option("--download-dir", default=".", show_default=True, help="Where to save auto-downloaded PDFs.")
@@ -114,6 +117,7 @@ def scan(
     no_brickognize: bool,
     embeddings: bool,
     embedding_weights: Optional[str],
+    capacity_reconcile: bool,
     locale: str,
     booklet: int,
     download_dir: str,
@@ -140,8 +144,8 @@ def scan(
         if not pdf:
             raise click.UsageError("--engine local requires a PDF path or --set to auto-download.")
         _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
-                   no_brickognize, embeddings, embedding_weights, no_rebrickable, out_dir,
-                   cache_dir, no_cache, panel_low, panel_high)
+                   no_brickognize, embeddings, embedding_weights, capacity_reconcile,
+                   no_rebrickable, out_dir, cache_dir, no_cache, panel_low, panel_high)
         return
 
     if not pdf and not extracts:
@@ -257,7 +261,15 @@ def debug(pdf: str, out_dir: str, page_spec: Optional[str], dpi: int,
 @click.option("--epochs", type=int, default=40, show_default=True, help="Max epochs (early stopping usually stops sooner).")
 @click.option("--variants-per-part", type=int, default=8, show_default=True,
               help="Augmented crops generated per reference image.")
+@click.option("--augment-style", type=click.Choice(["photo", "icon"]), default="icon", show_default=True,
+              help="'icon' flattens shading and adds a black edge outline so catalog photos look "
+                   "more like flat instruction-booklet icons (narrows the domain gap). 'photo' is the "
+                   "original catalog-photo pipeline.")
 @click.option("--triplets-per-epoch", type=int, default=200, show_default=True)
+@click.option("--mining", type=click.Choice(["random", "semihard"]), default="semihard", show_default=True,
+              help="'semihard' mines hard negatives from the current model each epoch instead of "
+                   "sampling them at random (keeps gradient alive; ~2x epoch time on CPU). 'random' is "
+                   "the original uniform sampling.")
 @click.option("--batch-size", type=int, default=16, show_default=True)
 @click.option("--val-frac", type=float, default=0.25, show_default=True,
               help="Fraction of each part's variants held out to measure retrieval accuracy each epoch.")
@@ -266,8 +278,8 @@ def debug(pdf: str, out_dir: str, page_spec: Optional[str], dpi: int,
 @click.option("--seed", type=int, default=0, show_default=True)
 def train_embedding(
     inventory_file: Optional[str], set_num: Optional[str], out_path: str, backbone: str,
-    embedding_dim: int, epochs: int, variants_per_part: int, triplets_per_epoch: int,
-    batch_size: int, val_frac: float, patience: int, seed: int,
+    embedding_dim: int, epochs: int, variants_per_part: int, augment_style: str,
+    triplets_per_epoch: int, mining: str, batch_size: int, val_frac: float, patience: int, seed: int,
 ) -> None:
     """Fine-tune a local part-embedding model on a set's reference images.
 
@@ -309,8 +321,8 @@ def train_embedding(
     if len(ref_images) < 2:
         raise click.UsageError("Need reference images for at least 2 distinct parts to train (need positive/negative pairs).")
 
-    click.echo(f"Augmenting into {variants_per_part} variants per part...")
-    dataset = build_augmented_dataset(ref_images, variants_per_part=variants_per_part, seed=seed)
+    click.echo(f"Augmenting into {variants_per_part} variants per part ({augment_style} style)...")
+    dataset = build_augmented_dataset(ref_images, variants_per_part=variants_per_part, seed=seed, style=augment_style)
 
     def progress(epoch, total, loss, val_accuracy):
         if val_accuracy is None:
@@ -319,10 +331,10 @@ def train_embedding(
             click.echo(f"  epoch {epoch + 1}/{total}: loss={loss:.4f} val_accuracy={val_accuracy:.3f}")
 
     click.echo(f"Training ({backbone}, up to {epochs} epochs, {triplets_per_epoch} triplets/epoch, "
-               f"patience={patience})...")
+               f"{mining} mining, patience={patience})...")
     result = train_embedding_model(
         dataset, out_path, backbone=backbone, embedding_dim=embedding_dim, epochs=epochs,
-        triplets_per_epoch=triplets_per_epoch, batch_size=batch_size, val_frac=val_frac,
+        triplets_per_epoch=triplets_per_epoch, mining=mining, batch_size=batch_size, val_frac=val_frac,
         patience=patience, seed=seed, progress_callback=progress,
     )
     acc_msg = f"{result.best_val_accuracy:.3f}" if result.best_val_accuracy is not None else "n/a (too little data for a val split)"
@@ -392,8 +404,8 @@ def _autofetch_pdf(set_num, locale, booklet, download_dir):
 
 
 def _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
-               no_brickognize, embeddings, embedding_weights, no_rebrickable, out_dir,
-               cache_dir, no_cache, panel_low, panel_high):
+               no_brickognize, embeddings, embedding_weights, capacity_reconcile,
+               no_rebrickable, out_dir, cache_dir, no_cache, panel_low, panel_high):
     """Local engine: detect callouts with OpenCV, identify with the free ensemble."""
     from .brickognize import BrickognizeClient
     from .inventory import load_inventory_file
@@ -495,6 +507,7 @@ def _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
     result = locate_local(
         pdf, inventory or [], identifier, dpi=dpi, page_spec=page_spec, max_pages=max_pages,
         detector=detector, use_color=True, reconcile_counts=reconcile_counts,
+        capacity_reconcile=capacity_reconcile,
         set_num=set_num, set_name=set_name, progress=progress,
     )
     click.echo("")

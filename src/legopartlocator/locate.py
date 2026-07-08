@@ -24,6 +24,69 @@ from .identify import IdentificationResult, PartIdentifier
 from .models import InventoryPart, LocatedPart, Occurrence, ScanResult
 from .reconcile import _inv_key
 
+# Capacity-reconcile tunables (see _resolve_assignments).
+_EMBED_ONLY_EPS = 1e-9
+_MIN_REROUTE_CONFIDENCE = 0.3
+
+
+def _is_embedding_only(components: Dict[str, float]) -> bool:
+    """True when a match was carried by embedding retrieval alone -- Brickognize
+    contributed nothing. These are the ones the embedding "attractor" inflates,
+    so they're the only matches capacity-reconcile is willing to divert."""
+    if not components:
+        return False
+    return (
+        components.get("brickognize", 0.0) <= _EMBED_ONLY_EPS
+        and components.get("embedding", 0.0) > _EMBED_ONLY_EPS
+    )
+
+
+def _resolve_assignments(
+    pending: List[tuple], capacity_reconcile: bool
+) -> List[Tuple[Optional[InventoryPart], float]]:
+    """Decide each crop's final (part, confidence).
+
+    Default (``capacity_reconcile`` False): every crop keeps the identifier's
+    own winner -- byte-for-byte the previous behaviour.
+
+    With capacity-reconcile: crops are resolved in descending confidence, and a
+    part that has already reached its inventory quantity stops accepting further
+    *embedding-only* matches (the attractor over-count). Such a crop is diverted
+    to its best still-available alternative above ``_MIN_REROUTE_CONFIDENCE``, or
+    to unknown if none qualifies. A Brickognize-corroborated winner is never
+    diverted, so genuinely repeated parts are preserved.
+
+    ``pending`` items are ``(bag, page_index, qty, seen_color, IdentificationResult)``.
+    """
+    if not capacity_reconcile:
+        return [(r.part, r.confidence) for (_b, _p, _q, _c, r) in pending]
+
+    order = sorted(range(len(pending)), key=lambda i: pending[i][4].confidence, reverse=True)
+    assigned_qty: Dict[str, int] = {}
+    out: List[Tuple[Optional[InventoryPart], float]] = [(None, 0.0)] * len(pending)
+    for i in order:
+        _bag, _page, qty, _color, res = pending[i]
+        if res.part is None:
+            continue
+        # Winner first, then the ranked alternatives as fallback homes.
+        candidates = [(res.part, float(res.confidence), _is_embedding_only(res.components))]
+        candidates += [(p, float(s), False) for (p, s) in res.alternatives]
+        for part, score, emb_only in candidates:
+            is_winner = part is res.part
+            if not is_winner and score < _MIN_REROUTE_CONFIDENCE:
+                continue  # don't reroute into a weak alternative
+            key = _inv_key(part)
+            cap = part.quantity if part.quantity else None
+            saturated = cap is not None and assigned_qty.get(key, 0) >= cap
+            # A saturated part only still accepts a corroborated winner; an
+            # embedding-only winner or any alternative is turned away.
+            if saturated and (emb_only or not is_winner):
+                continue
+            out[i] = (part, score)
+            assigned_qty[key] = assigned_qty.get(key, 0) + qty
+            break
+    return out
+
 
 def make_identifier(
     inventory: Sequence[InventoryPart],
@@ -52,6 +115,7 @@ def assemble_result(
     *,
     use_color: bool = True,
     reconcile_counts: bool = True,
+    capacity_reconcile: bool = True,
     source_pdf: Optional[str] = None,
     set_num: Optional[str] = None,
     set_name: Optional[str] = None,
@@ -68,9 +132,9 @@ def assemble_result(
     segments, warnings = segment_bags(page_extracts, num_pages)
     p2b = page_to_bag(segments)
 
-    by_key: Dict[str, LocatedPart] = {}
-    conf_acc: Dict[str, List[float]] = {}
-    unidentified = 0
+    # Phase 1: identify every crop, collecting reads without bucketing yet, so
+    # capacity-reconcile (phase 2) can resolve them in confidence order.
+    pending: List[tuple] = []  # (bag, page_index, qty, seen_color, IdentificationResult)
     identify_failures = 0
     identify_failure_msgs: List[str] = []
 
@@ -93,37 +157,45 @@ def assemble_result(
                 if len(identify_failure_msgs) < 3 and msg not in identify_failure_msgs:
                     identify_failure_msgs.append(msg)
                 result = IdentificationResult(part=None, confidence=0.0)
-            qty = dc.callout.quantity
+            pending.append((bag, det.page_index, dc.callout.quantity, seen_color, result))
 
-            if result.part is not None:
-                key = _inv_key(result.part)
-                lp = by_key.get(key)
-                if lp is None:
-                    p = result.part
-                    lp = LocatedPart(
-                        key=key, name=p.name, part_num=p.part_num,
-                        color_name=p.color_name, element_id=p.element_id,
-                        image_url=p.image_url,
-                        inventory_qty=p.quantity if reconcile_counts else None,
-                        reconciled=reconcile_counts,
-                    )
-                    by_key[key] = lp
-                    conf_acc[key] = []
-                lp.occurrences.append(Occurrence(bag=bag, page_index=det.page_index, quantity=qty))
-                conf_acc[key].append(result.confidence)
-            else:
-                unidentified += 1
-                key = f"unknown:{seen_color or '?'}"
-                lp = by_key.get(key)
-                if lp is None:
-                    lp = LocatedPart(
-                        key=key, name=f"Unidentified ({seen_color or 'unknown colour'})",
-                        color_name=seen_color, reconciled=False,
-                    )
-                    by_key[key] = lp
-                    conf_acc[key] = []
-                lp.occurrences.append(Occurrence(bag=bag, page_index=det.page_index, quantity=qty))
-                conf_acc[key].append(0.0)
+    # Phase 2: resolve each crop's winner (optionally capacity/trust-aware),
+    # then bucket into LocatedParts exactly as before.
+    assignments = _resolve_assignments(pending, capacity_reconcile and reconcile_counts)
+
+    by_key: Dict[str, LocatedPart] = {}
+    conf_acc: Dict[str, List[float]] = {}
+    unidentified = 0
+
+    for (bag, page_index, qty, seen_color, _result), (part, confidence) in zip(pending, assignments):
+        if part is not None:
+            key = _inv_key(part)
+            lp = by_key.get(key)
+            if lp is None:
+                lp = LocatedPart(
+                    key=key, name=part.name, part_num=part.part_num,
+                    color_name=part.color_name, element_id=part.element_id,
+                    image_url=part.image_url,
+                    inventory_qty=part.quantity if reconcile_counts else None,
+                    reconciled=reconcile_counts,
+                )
+                by_key[key] = lp
+                conf_acc[key] = []
+            lp.occurrences.append(Occurrence(bag=bag, page_index=page_index, quantity=qty))
+            conf_acc[key].append(confidence)
+        else:
+            unidentified += 1
+            key = f"unknown:{seen_color or '?'}"
+            lp = by_key.get(key)
+            if lp is None:
+                lp = LocatedPart(
+                    key=key, name=f"Unidentified ({seen_color or 'unknown colour'})",
+                    color_name=seen_color, reconciled=False,
+                )
+                by_key[key] = lp
+                conf_acc[key] = []
+            lp.occurrences.append(Occurrence(bag=bag, page_index=page_index, quantity=qty))
+            conf_acc[key].append(0.0)
 
     for key, lp in by_key.items():
         lp.bags = sorted({o.bag for o in lp.occurrences})
@@ -167,6 +239,7 @@ def locate_local(
     detector=None,
     use_color: bool = True,
     reconcile_counts: bool = True,
+    capacity_reconcile: bool = True,
     set_num: Optional[str] = None,
     set_name: Optional[str] = None,
     progress=None,
@@ -197,6 +270,7 @@ def locate_local(
     result = assemble_result(
         detections, inventory, identifier, total,
         use_color=use_color, reconcile_counts=reconcile_counts,
+        capacity_reconcile=capacity_reconcile,
         source_pdf=str(pdf_path), set_num=set_num, set_name=set_name,
     )
     result.warnings.extend(ordinal_warnings)

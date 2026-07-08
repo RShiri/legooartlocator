@@ -169,3 +169,99 @@ def test_parts_list_page_is_skipped():
     result = assemble_result(detections, inv, ident, num_pages=2, use_color=False)
     red = next(p for p in result.parts if p.part_num == "3001")
     assert red.total_seen == 2  # BOM page's 99 excluded
+
+
+# --- capacity-reconcile (--capacity-reconcile): divert the embedding "attractor" ---
+
+def _cap_inv():
+    return [
+        InventoryPart(part_num="A1", name="Attractor Part", color_id=1, color_name="Red", quantity=1),
+        InventoryPart(part_num="B2", name="Roomy Part", color_id=2, color_name="Blue", quantity=4),
+    ]
+
+
+class PresetIdentifier:
+    """Returns a preset IdentificationResult per crop tag (with components and
+    alternatives set), so capacity-reconcile's trust/capacity logic can run."""
+
+    def __init__(self, mapping):
+        self.mapping = mapping  # tag -> IdentificationResult
+
+    def identify(self, crop_bytes, seen_color=None):
+        return self.mapping.get(crop_bytes, IdentificationResult(part=None, confidence=0.0))
+
+
+def _embed_only_hit(part, alt):
+    """A match carried by embedding alone (Brickognize contributed nothing),
+    with ``alt`` as its runner-up -- the shape the attractor produces."""
+    return IdentificationResult(
+        part=part, confidence=0.7,
+        components={"embedding": 0.7, "brickognize": 0.0},
+        alternatives=[(alt, 0.5)],
+    )
+
+
+def test_capacity_reconcile_diverts_embedding_only_overcount():
+    inv = _cap_inv()
+    a, b = inv
+    ident = PresetIdentifier({
+        b"c1": _embed_only_hit(a, b),
+        b"c2": _embed_only_hit(a, b),
+        b"c3": _embed_only_hit(a, b),
+    })
+    dets = [PageDetection(page_index=0, bag_marker=1,
+                          callouts=[_callout(1, b"c1"), _callout(1, b"c2"), _callout(1, b"c3")])]
+
+    # With reconcile disabled, the attractor A (inventory qty 1) soaks up all three.
+    base = assemble_result(dets, inv, ident, num_pages=1, use_color=False, capacity_reconcile=False)
+    a_base = next(p for p in base.parts if p.part_num == "A1")
+    assert a_base.total_seen == 3 and a_base.count_matches is False
+
+    # Capacity-reconcile: A keeps its one allowed crop; the surplus diverts to B.
+    fixed = assemble_result(dets, inv, ident, num_pages=1, use_color=False, capacity_reconcile=True)
+    a_fixed = next(p for p in fixed.parts if p.part_num == "A1")
+    b_fixed = next(p for p in fixed.parts if p.part_num == "B2")
+    assert a_fixed.total_seen == 1 and a_fixed.count_matches is True
+    assert b_fixed.total_seen == 2
+
+
+def test_capacity_reconcile_keeps_corroborated_overcount():
+    inv = _cap_inv()
+    a, b = inv
+    corroborated = IdentificationResult(
+        part=a, confidence=0.9,
+        components={"embedding": 0.6, "brickognize": 0.8},  # Brickognize agrees
+        alternatives=[(b, 0.5)],
+    )
+    ident = PresetIdentifier({t: corroborated for t in (b"c1", b"c2", b"c3")})
+    dets = [PageDetection(page_index=0, bag_marker=1,
+                          callouts=[_callout(1, b"c1"), _callout(1, b"c2"), _callout(1, b"c3")])]
+
+    fixed = assemble_result(dets, inv, ident, num_pages=1, use_color=False, capacity_reconcile=True)
+    a_fixed = next(p for p in fixed.parts if p.part_num == "A1")
+    # A corroborated winner is never diverted, even past its inventory quantity.
+    assert a_fixed.total_seen == 3
+    assert not any(p.part_num == "B2" for p in fixed.parts)
+
+
+def test_capacity_reconcile_is_on_by_default():
+    inv = _cap_inv()
+    a, b = inv
+    ident = PresetIdentifier({t: _embed_only_hit(a, b) for t in (b"c1", b"c2", b"c3")})
+    dets = [PageDetection(page_index=0, bag_marker=1,
+                          callouts=[_callout(1, b"c1"), _callout(1, b"c2"), _callout(1, b"c3")])]
+    result = assemble_result(dets, inv, ident, num_pages=1, use_color=False)  # no flag -> default on
+    a_res = next(p for p in result.parts if p.part_num == "A1")
+    assert a_res.total_seen == 1  # attractor capped by default
+    assert any(p.part_num == "B2" for p in result.parts)
+
+
+def test_capacity_reconcile_can_be_disabled():
+    inv = _cap_inv()
+    a, b = inv
+    ident = PresetIdentifier({b"c1": _embed_only_hit(a, b), b"c2": _embed_only_hit(a, b)})
+    dets = [PageDetection(page_index=0, bag_marker=1, callouts=[_callout(1, b"c1"), _callout(1, b"c2")])]
+    off = assemble_result(dets, inv, ident, num_pages=1, use_color=False, capacity_reconcile=False)
+    a_off = next(p for p in off.parts if p.part_num == "A1")
+    assert a_off.total_seen == 2  # both crops stay on the attractor when disabled
+    assert not any(p.part_num == "B2" for p in off.parts)

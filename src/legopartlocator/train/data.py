@@ -110,10 +110,35 @@ def _pad_on_background(img: np.ndarray, rng: random.Random) -> np.ndarray:
     return cv2.resize(canvas, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
-def augment(image: bytes, n: int, seed: int = 0) -> List[bytes]:
-    """Return ``n`` deterministic augmented variants of a reference image."""
+def _edge_outline(img: np.ndarray, rng: random.Random) -> np.ndarray:
+    """Paint a black edge outline (Canny -> optional 1px dilate) onto the image.
+
+    Instruction-booklet icons are flat line art with a dark stroke around the
+    part; catalog photos have no such outline. Adding one is the single most
+    characteristic step toward the icon look."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    lo = rng.randint(40, 80)
+    edges = cv2.Canny(gray, lo, lo * 2)
+    if rng.random() < 0.5:
+        edges = cv2.dilate(edges, np.ones((2, 2), np.uint8))
+    out = img.copy()
+    out[edges > 0] = (0, 0, 0)
+    return out
+
+
+def augment(image: bytes, n: int, seed: int = 0, style: str = "icon") -> List[bytes]:
+    """Return ``n`` deterministic augmented variants of a reference image.
+
+    ``style="icon"`` (default, measured a net win on real scans) narrows the
+    domain gap toward flat instruction-booklet icons: it *always* flattens the
+    shading (vs. the photo path's coin-flip) and then adds a black edge outline,
+    since real icons are flat line art with a dark stroke rather than glossy 3D
+    renders. ``style="photo"`` is the original pipeline, unchanged (kept to
+    reproduce the earlier catalog-photo baseline)."""
     if n <= 0:
         return []
+    if style not in ("photo", "icon"):
+        raise ValueError(f"augment: unknown style {style!r} (expected 'photo' or 'icon')")
     img = _decode(image)
     out: List[bytes] = []
     for i in range(n):
@@ -121,21 +146,23 @@ def augment(image: bytes, n: int, seed: int = 0) -> List[bytes]:
         variant = img.copy()
         variant = _rotate_and_warp(variant, rng)
         variant = _color_jitter(variant, rng)
-        if rng.random() < 0.5:
+        if style == "icon" or rng.random() < 0.5:
             variant = _flatten_shading(variant, rng)
         variant = _pad_on_background(variant, rng)
         variant = _blur_and_resample(variant, rng)
+        if style == "icon":
+            variant = _edge_outline(variant, rng)
         out.append(_encode(variant))
     return out
 
 
 def build_augmented_dataset(
-    ref_images: Dict[str, bytes], variants_per_part: int = 8, seed: int = 0
+    ref_images: Dict[str, bytes], variants_per_part: int = 8, seed: int = 0, style: str = "icon"
 ) -> Dict[str, List[bytes]]:
     """Expand one reference image per part into ``variants_per_part`` augmented crops."""
     dataset: Dict[str, List[bytes]] = {}
     for i, (part_num, image) in enumerate(sorted(ref_images.items())):
-        dataset[part_num] = augment(image, variants_per_part, seed=seed * 1_000_003 + i)
+        dataset[part_num] = augment(image, variants_per_part, seed=seed * 1_000_003 + i, style=style)
     return dataset
 
 

@@ -2,8 +2,14 @@
 
 import cv2
 import numpy as np
+import pytest
 
 from legopartlocator.train.data import augment, build_augmented_dataset, train_val_split
+
+
+def _count_near_black(png_bytes: bytes, thresh: int = 30) -> int:
+    img = cv2.imdecode(np.frombuffer(png_bytes, np.uint8), cv2.IMREAD_COLOR)
+    return int(np.count_nonzero(np.all(img <= thresh, axis=2)))
 
 
 def _make_reference_image(w=120, h=100, color=(40, 90, 180)) -> bytes:
@@ -102,3 +108,48 @@ def test_train_val_split_is_deterministic_given_seed():
     a = train_val_split(_fake_dataset(), val_frac=0.25, seed=5)
     b = train_val_split(_fake_dataset(), val_frac=0.25, seed=5)
     assert a == b
+
+
+# --- icon-style augmentation (--augment-style icon): flat shading + black outline ---
+
+def test_default_style_is_icon_and_differs_from_photo():
+    ref = _make_reference_image()
+    # Default is now the "icon" pipeline (measured a net win on real scans).
+    assert augment(ref, n=3, seed=5) == augment(ref, n=3, seed=5, style="icon")
+    assert augment(ref, n=3, seed=5, style="photo") != augment(ref, n=3, seed=5, style="icon")
+
+
+def test_icon_style_adds_black_outline_pixels():
+    ref = _make_reference_image()
+    photo = augment(ref, n=4, seed=3, style="photo")
+    icon = augment(ref, n=4, seed=3, style="icon")
+    photo_black = sum(_count_near_black(v) for v in photo)
+    icon_black = sum(_count_near_black(v) for v in icon)
+    assert icon_black > photo_black  # the outline paints edge pixels black
+
+
+def test_icon_variants_decode_to_same_shape_as_input():
+    ref = _make_reference_image(w=120, h=100)
+    ref_img = cv2.imdecode(np.frombuffer(ref, np.uint8), cv2.IMREAD_COLOR)
+    for variant in augment(ref, n=3, seed=4, style="icon"):
+        decoded = cv2.imdecode(np.frombuffer(variant, np.uint8), cv2.IMREAD_COLOR)
+        assert decoded is not None
+        assert decoded.shape == ref_img.shape
+
+
+def test_icon_style_is_deterministic_given_seed():
+    ref = _make_reference_image()
+    assert augment(ref, n=3, seed=9, style="icon") == augment(ref, n=3, seed=9, style="icon")
+
+
+def test_augment_rejects_unknown_style():
+    ref = _make_reference_image()
+    with pytest.raises(ValueError):
+        augment(ref, n=1, seed=0, style="sketch")
+
+
+def test_build_augmented_dataset_threads_style():
+    refs = {"3001": _make_reference_image()}
+    photo = build_augmented_dataset(refs, variants_per_part=3, seed=0, style="photo")
+    icon = build_augmented_dataset(refs, variants_per_part=3, seed=0, style="icon")
+    assert photo["3001"] != icon["3001"]
