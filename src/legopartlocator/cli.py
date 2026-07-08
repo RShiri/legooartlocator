@@ -88,6 +88,8 @@ def main() -> None:
               help="Local set inventory CSV/JSON (BrickLink/Rebrickable export). Enables the local engine with no key.")
 @click.option("--no-brickognize", is_flag=True, help="[local engine] Disable the Brickognize signal.")
 @click.option("--embeddings", is_flag=True, help="[local engine] Enable embedding retrieval (needs the [ml] extra + network).")
+@click.option("--embedding-weights", type=click.Path(exists=True, dir_okay=False), default=None,
+              help="[local engine] Use a checkpoint from `lpl train-embedding` instead of pretrained CLIP (implies --embeddings).")
 @click.option("--locale", default="en-gb", show_default=True, help="LEGO site locale for auto-download (e.g. en-us, de-de).")
 @click.option("--booklet", type=int, default=1, show_default=True, help="Which booklet to scan when a set has several.")
 @click.option("--download-dir", default=".", show_default=True, help="Where to save auto-downloaded PDFs.")
@@ -111,6 +113,7 @@ def scan(
     inventory_file: Optional[str],
     no_brickognize: bool,
     embeddings: bool,
+    embedding_weights: Optional[str],
     locale: str,
     booklet: int,
     download_dir: str,
@@ -137,7 +140,7 @@ def scan(
         if not pdf:
             raise click.UsageError("--engine local requires a PDF path or --set to auto-download.")
         _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
-                   no_brickognize, embeddings, no_rebrickable, out_dir,
+                   no_brickognize, embeddings, embedding_weights, no_rebrickable, out_dir,
                    cache_dir, no_cache, panel_low, panel_high)
         return
 
@@ -243,6 +246,78 @@ def debug(pdf: str, out_dir: str, page_spec: Optional[str], dpi: int,
     click.echo("Open the page_*.png files to see what was caught; tune --panel-low/--panel-high from mask_*.png.")
 
 
+@main.command("train-embedding")
+@click.option("--inventory-file", type=click.Path(exists=True, dir_okay=False), default=None,
+              help="Local set inventory CSV/JSON (needs an image_url column).")
+@click.option("--set", "set_num", default=None, help="LEGO set number; fetches the inventory via REBRICKABLE_API_KEY.")
+@click.option("--out", "out_path", default="models/lego_embed.pt", show_default=True, help="Checkpoint output path.")
+@click.option("--backbone", type=click.Choice(["mobilenet_v3_small", "resnet18"]), default="mobilenet_v3_small",
+              show_default=True)
+@click.option("--embedding-dim", type=int, default=256, show_default=True)
+@click.option("--epochs", type=int, default=5, show_default=True)
+@click.option("--variants-per-part", type=int, default=8, show_default=True,
+              help="Augmented crops generated per reference image.")
+@click.option("--triplets-per-epoch", type=int, default=200, show_default=True)
+@click.option("--batch-size", type=int, default=16, show_default=True)
+@click.option("--seed", type=int, default=0, show_default=True)
+def train_embedding(
+    inventory_file: Optional[str], set_num: Optional[str], out_path: str, backbone: str,
+    embedding_dim: int, epochs: int, variants_per_part: int, triplets_per_epoch: int,
+    batch_size: int, seed: int,
+) -> None:
+    """Fine-tune a local part-embedding model on a set's reference images.
+
+    No paid API involved: pulls one reference photo per part (from an
+    inventory file, or --set with a free REBRICKABLE_API_KEY), augments it
+    into several synthetic variants, and trains with triplet loss so same-part
+    crops embed close together. The resulting checkpoint is a drop-in
+    replacement for pretrained CLIP: `lpl scan --engine local --embeddings
+    --embedding-weights <out_path>`.
+    """
+    _load_dotenv()
+    try:
+        from .train.data import build_augmented_dataset, collect_training_images
+        from .train.embedding_trainer import train_embedding_model
+    except ImportError as exc:
+        raise click.UsageError(
+            f"train-embedding needs the optional training dependencies ({exc.name} is missing). "
+            'Install them with:  pip install -e ".[train]"'
+        )
+
+    from .inventory import load_inventory_file
+
+    if inventory_file:
+        inventory = load_inventory_file(inventory_file)
+        click.echo(f"Loaded {len(inventory)} inventory lines from {inventory_file}.")
+    elif set_num:
+        inventory, _set_name = _fetch_inventory(set_num)
+        if not inventory:
+            raise click.UsageError(f"Could not fetch an inventory for set {set_num}.")
+    else:
+        raise click.UsageError("Provide --inventory-file or --set.")
+
+    click.echo("Downloading reference images...")
+    ref_images = collect_training_images(inventory)
+    click.echo(f"Got {len(ref_images)}/{len(inventory)} reference images (missing image_url or fetch failures are skipped).")
+    if len(ref_images) < 2:
+        raise click.UsageError("Need reference images for at least 2 distinct parts to train (need positive/negative pairs).")
+
+    click.echo(f"Augmenting into {variants_per_part} variants per part...")
+    dataset = build_augmented_dataset(ref_images, variants_per_part=variants_per_part, seed=seed)
+
+    def progress(epoch, total, loss):
+        click.echo(f"  epoch {epoch + 1}/{total}: loss={loss:.4f}")
+
+    click.echo(f"Training ({backbone}, {epochs} epochs, {triplets_per_epoch} triplets/epoch)...")
+    result = train_embedding_model(
+        dataset, out_path, backbone=backbone, embedding_dim=embedding_dim, epochs=epochs,
+        triplets_per_epoch=triplets_per_epoch, batch_size=batch_size, seed=seed,
+        progress_callback=progress,
+    )
+    click.echo(f"\nWrote {result.out_path} (final loss {result.final_loss:.4f}, "
+               f"{result.n_parts} parts, {result.n_triplets_seen} triplets seen).")
+
+
 def _render_and_extract(pdf, page_spec, max_pages, dpi, triage_dpi, single_pass, cache_dir, no_cache):
     from .pdf_render import PageRenderer, parse_page_range, page_count, render_pages
     from .vision import VisionExtractor, extract_pages, extract_pages_two_pass
@@ -304,7 +379,7 @@ def _autofetch_pdf(set_num, locale, booklet, download_dir):
 
 
 def _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
-               no_brickognize, embeddings, no_rebrickable, out_dir,
+               no_brickognize, embeddings, embedding_weights, no_rebrickable, out_dir,
                cache_dir, no_cache, panel_low, panel_high):
     """Local engine: detect callouts with OpenCV, identify with the free ensemble."""
     from .brickognize import BrickognizeClient
@@ -357,12 +432,20 @@ def _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
         reconcile_counts = False
     else:
         gallery = backend = None
-        if embeddings:
+        if embeddings or embedding_weights:
             try:
-                from .embedding import ClipBackend, build_gallery, download_reference_images
+                from .embedding import build_gallery, download_reference_images
 
-                click.echo("Building embedding gallery (downloading reference images)...")
-                backend = ClipBackend()
+                if embedding_weights:
+                    from .embedding import TrainedBackend
+
+                    click.echo(f"Building embedding gallery (trained checkpoint: {embedding_weights})...")
+                    backend = TrainedBackend(embedding_weights)
+                else:
+                    from .embedding import ClipBackend
+
+                    click.echo("Building embedding gallery (downloading reference images)...")
+                    backend = ClipBackend()
                 ref_images = download_reference_images(inventory)
                 gallery = build_gallery(inventory, ref_images, backend)
                 click.echo(f"Gallery: {len(gallery)} parts embedded.")

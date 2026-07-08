@@ -26,6 +26,11 @@ dev = ["pytest>=8.0"]
 local = ["opencv-python-headless>=4.8", "pytesseract>=0.3.10", "pillow>=10.0"]
 # Heavy, optional: local image-embedding part matcher (no paid API).
 ml = ["torch>=2.0", "open-clip-torch>=2.20", "pillow>=10.0"]
+# Heavier still: train our own local part-embedding model (`lpl train-embedding`),
+# no paid API. torch-directml gives real GPU acceleration on Windows for
+# non-CUDA cards (AMD/Intel); harmless no-op to install on other platforms
+# where it isn't needed, since training just falls back to CPU/CUDA.
+train = ["torch>=2.0", "torchvision>=0.15", "pillow>=10.0", "torch-directml>=0.2; sys_platform == 'win32'"]
 
 [project.scripts]
 lpl = "legopartlocator.cli:main"

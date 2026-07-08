@@ -162,3 +162,50 @@ class ClipBackend(EmbeddingBackend):  # pragma: no cover - requires torch/open_c
         with torch.no_grad():
             feats = self.model.encode_image(batch)
         return feats.cpu().float().numpy()
+
+
+class TrainedBackend(EmbeddingBackend):  # pragma: no cover - requires torch
+    """Our own fine-tuned encoder (see ``train.embedding_trainer``), loaded
+    from a checkpoint on disk. Requires the optional ``[train]`` extra
+    (a superset of ``[ml]``: torch + torchvision, optionally torch-directml).
+
+    Same ``embed_images`` contract as ``ClipBackend`` -- a drop-in
+    replacement wherever a ``ClipBackend`` is used today (``Gallery``,
+    ``build_gallery``, ``identify.py``'s ensemble are all unaffected).
+    """
+
+    def __init__(self, checkpoint_path: str, device: Optional[str] = None):
+        try:
+            import torch  # type: ignore
+        except ImportError as exc:
+            raise ImportError(
+                "TrainedBackend needs the optional training deps. "
+                "Install with: pip install -e \".[train]\""
+            ) from exc
+        # Reuse the exact architecture/preprocessing the checkpoint was
+        # trained with, rather than duplicating it here and risking drift.
+        from .train.embedding_trainer import _build_backbone, _preprocess_transform
+
+        self._torch = torch
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        self.embedding_dim = checkpoint["embedding_dim"]
+        self.model = _build_backbone(torch, checkpoint["backbone"], self.embedding_dim)
+        self.model.load_state_dict(checkpoint["state_dict"])
+        self.model.eval().to(self.device)
+        self.preprocess = _preprocess_transform()
+
+    def embed_images(self, images: Sequence[bytes]) -> np.ndarray:
+        import io
+
+        from PIL import Image  # type: ignore
+
+        torch = self._torch
+        tensors = []
+        for blob in images:
+            pil = Image.open(io.BytesIO(blob)).convert("RGB")
+            tensors.append(self.preprocess(pil))
+        batch = torch.stack(tensors).to(self.device)
+        with torch.no_grad():
+            feats = torch.nn.functional.normalize(self.model(batch), p=2, dim=-1)
+        return feats.cpu().float().numpy()

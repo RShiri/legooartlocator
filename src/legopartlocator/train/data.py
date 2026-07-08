@@ -1,0 +1,139 @@
+"""Training-image collection and augmentation.
+
+Two independent pieces:
+
+  * ``collect_training_images`` -- fetch one reference photo per part_num
+    (thin wrapper over ``embedding.download_reference_images``, so it shares
+    the exact same dedup-by-part_num behaviour the zero-shot embedding path
+    already relies on: the model is trained to recognise *shape*, colour
+    invariantly, since colour agreement is already a separate signal in
+    ``identify.py``'s ensemble).
+  * ``augment`` -- pure numpy/cv2 image transforms, no network, no torch.
+    Deterministic given a seed so it's unit-testable offline.
+
+Reference photos are glossy, generously-margined catalog images; the crops
+this model will actually see at inference are flat, tightly-cropped
+instruction-booklet icons. ``augment`` can't close that gap perfectly, but
+narrows it: colour jitter (so colour isn't a shortcut), blur/downsample
+(mimics a low-res icon render), a flatten pass (posterize + edge-preserving
+smoothing, toward a flat-shaded look), and padding/background composition
+(mimics variable crop margins).
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Callable, Dict, List, Optional, Sequence
+
+import cv2
+import numpy as np
+
+from ..embedding import download_reference_images
+from ..models import InventoryPart
+
+
+def collect_training_images(
+    parts: Sequence[InventoryPart], get: Optional[Callable[[str], Optional[bytes]]] = None
+) -> Dict[str, bytes]:
+    """One reference photo per part_num -- thin wrapper over
+    ``embedding.download_reference_images`` (kept as its own name/entry point
+    in case training-specific caching or filtering is added later without
+    disturbing the inference-path helper)."""
+    return download_reference_images(parts, get=get)
+
+
+def _decode(image: bytes) -> np.ndarray:
+    buf = np.frombuffer(image, dtype=np.uint8)
+    img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("augment: could not decode image bytes")
+    return img
+
+
+def _encode(img: np.ndarray) -> bytes:
+    ok, buf = cv2.imencode(".png", img)
+    if not ok:  # pragma: no cover - only fails on a malformed/empty array
+        raise ValueError("augment: cv2.imencode failed")
+    return buf.tobytes()
+
+
+def _rotate_and_warp(img: np.ndarray, rng: random.Random) -> np.ndarray:
+    h, w = img.shape[:2]
+    angle = rng.uniform(-25, 25)
+    scale = rng.uniform(0.85, 1.05)
+    matrix = cv2.getRotationMatrix2D((w / 2, h / 2), angle, scale)
+    # Small random perspective wobble on top of the rotation, via the
+    # translation terms -- enough to vary viewpoint without destroying shape.
+    matrix[0, 2] += rng.uniform(-0.03, 0.03) * w
+    matrix[1, 2] += rng.uniform(-0.03, 0.03) * h
+    return cv2.warpAffine(
+        img, matrix, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255)
+    )
+
+
+def _color_jitter(img: np.ndarray, rng: random.Random) -> np.ndarray:
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[:, :, 0] = (hsv[:, :, 0] + rng.uniform(-15, 15)) % 180
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * rng.uniform(0.6, 1.3), 0, 255)
+    hsv[:, :, 2] = np.clip(hsv[:, :, 2] * rng.uniform(0.7, 1.3) + rng.uniform(-20, 20), 0, 255)
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+
+def _blur_and_resample(img: np.ndarray, rng: random.Random) -> np.ndarray:
+    h, w = img.shape[:2]
+    if rng.random() < 0.7:
+        k = rng.choice([3, 5])
+        img = cv2.GaussianBlur(img, (k, k), 0)
+    factor = rng.uniform(0.3, 0.7)
+    small = cv2.resize(img, (max(1, int(w * factor)), max(1, int(h * factor))), interpolation=cv2.INTER_AREA)
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def _flatten_shading(img: np.ndarray, rng: random.Random) -> np.ndarray:
+    """Posterize + edge-preserving smoothing: nudges a glossy 3D render
+    toward the flat-shaded look of an instruction-booklet icon."""
+    smoothed = cv2.edgePreservingFilter(img, flags=cv2.RECURS_FILTER, sigma_s=40, sigma_r=0.3)
+    levels = rng.choice([4, 6, 8])
+    quantized = (np.round(smoothed.astype(np.float32) / 255 * levels) / levels * 255).astype(np.uint8)
+    return quantized
+
+
+def _pad_on_background(img: np.ndarray, rng: random.Random) -> np.ndarray:
+    h, w = img.shape[:2]
+    pad_frac = rng.uniform(0.0, 0.25)
+    pad = int(min(h, w) * pad_frac)
+    if pad == 0:
+        return img
+    bg = int(rng.uniform(235, 255))
+    canvas = np.full((h + 2 * pad, w + 2 * pad, 3), bg, dtype=np.uint8)
+    canvas[pad : pad + h, pad : pad + w] = img
+    return cv2.resize(canvas, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def augment(image: bytes, n: int, seed: int = 0) -> List[bytes]:
+    """Return ``n`` deterministic augmented variants of a reference image."""
+    if n <= 0:
+        return []
+    img = _decode(image)
+    out: List[bytes] = []
+    for i in range(n):
+        rng = random.Random(seed * 1_000_003 + i)
+        variant = img.copy()
+        variant = _rotate_and_warp(variant, rng)
+        variant = _color_jitter(variant, rng)
+        if rng.random() < 0.5:
+            variant = _flatten_shading(variant, rng)
+        variant = _pad_on_background(variant, rng)
+        variant = _blur_and_resample(variant, rng)
+        out.append(_encode(variant))
+    return out
+
+
+def build_augmented_dataset(
+    ref_images: Dict[str, bytes], variants_per_part: int = 8, seed: int = 0
+) -> Dict[str, List[bytes]]:
+    """Expand one reference image per part into ``variants_per_part`` augmented crops."""
+    dataset: Dict[str, List[bytes]] = {}
+    for i, (part_num, image) in enumerate(sorted(ref_images.items())):
+        dataset[part_num] = augment(image, variants_per_part, seed=seed * 1_000_003 + i)
+    return dataset

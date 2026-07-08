@@ -152,6 +152,32 @@ doesn't re-pay for or crash on every callout; one failed identify no longer
 aborts the whole scan — it's logged as a warning and that callout falls into
 the "unidentified" bucket.
 
+### Training your own embedding model
+
+`--embeddings` normally uses pretrained CLIP zero-shot (no training). You can
+instead fine-tune a small CNN (MobileNetV3-Small/ResNet18) on a set's own
+reference images with triplet-loss metric learning — no paid API, no Claude:
+
+```bash
+pip install -e ".[train]"          # torch + torchvision (+ torch-directml on Windows)
+lpl train-embedding --inventory-file samples/76307_inventory.csv --out models/lego_embed.pt
+lpl scan instructions.pdf --engine local --embeddings --embedding-weights models/lego_embed.pt
+```
+
+Each part's single reference photo is expanded into several augmented
+variants (rotation, colour jitter, blur/downsample, a flat-shading pass, and
+background padding — narrowing the gap between glossy catalog photos and the
+flatter instruction-booklet icon crops actually scanned) and trained so
+same-part crops embed close together. On Windows with a non-CUDA GPU (AMD/
+Intel), `torch-directml` gives real acceleration; otherwise it falls back to
+CPU. This is a retrieval model for *this project's* known parts, not a
+general-purpose LEGO classifier — realistic expectation is an incremental
+accuracy boost over pretrained CLIP on your own inventories, not a solved
+problem. The triplet-sampling logic (`train/sampling.py`) is unit-tested
+offline; the actual torch training loop (`train/embedding_trainer.py`) and
+`embedding.TrainedBackend` need the `[train]` extra to run, same as
+`ClipBackend` already does for `[ml]`.
+
 ### Calibrating detection on a real page
 
 The OpenCV thresholds (`DetectConfig`: gray band, cell-area/aspect gates) are
@@ -172,7 +198,7 @@ available on `lpl scan --engine local`) once you know what to change.
 ## Development
 
 ```bash
-pytest         # offline unit tests (100): bags, reconcile, local engine, identify, etc.
+pytest         # offline unit tests (119, +3 skipped without the [train] extra): bags, reconcile, local engine, identify, training, etc.
 ```
 
 CI (`.github/workflows/ci.yml`) runs the suite on Ubuntu (3.11, 3.12) and
@@ -190,7 +216,8 @@ src/legopartlocator/
   debug_overlay.py # visualise local detection: overlays, mask, per-page stats
   identify.py      # ensemble part identifier (Brickognize + embedding + colour)
   brickognize.py   # free part-ID API client (cached, retried, throttled)
-  embedding.py      # cosine-NN gallery over inventory reference images
+  embedding.py      # cosine-NN gallery over inventory reference images; ClipBackend/TrainedBackend
+  train/            # `lpl train-embedding`: data augmentation, triplet sampling, training loop
   colors.py         # LEGO colour table + dominant-colour extraction
   inventory.py      # local CSV/JSON inventory loader (no API key)
   fetcher.py        # auto-download instruction PDFs from lego.com by set number
