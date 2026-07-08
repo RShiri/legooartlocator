@@ -256,6 +256,61 @@ def test_capacity_reconcile_is_on_by_default():
     assert any(p.part_num == "B2" for p in result.parts)
 
 
+def test_dump_crops_writes_files_and_manifest(tmp_path):
+    import json
+
+    inv = _inv()
+    detections = [
+        PageDetection(page_index=0, bag_marker=1, callouts=[_callout(2, b"red"), _callout(1, b"mystery")]),
+    ]
+    ident = FakeIdentifier(inv, {b"red": (0, 0.9)})  # b"mystery" -> unidentified
+    out = tmp_path / "crops"
+
+    assemble_result(detections, inv, ident, num_pages=1, use_color=False, dump_crops_dir=out)
+
+    assert (out / "3001" / "p000_i000.png").read_bytes() == b"red"
+    assert (out / "unknown" / "p000_i001.png").read_bytes() == b"mystery"
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert len(manifest) == 2
+    red, unknown = manifest
+    assert red["part_num"] == "3001" and red["raw_part_num"] == "3001"
+    assert red["file"] == "3001/p000_i000.png"
+    assert red["page_index"] == 0 and red["bag"] == 1 and red["quantity"] == 2
+    assert red["confidence"] == 0.9
+    assert isinstance(red["components"], dict) and isinstance(red["alternatives"], list)
+    assert unknown["part_num"] is None and unknown["file"] == "unknown/p000_i001.png"
+
+
+def test_dump_crops_records_raw_winner_when_diverted(tmp_path):
+    import json
+
+    inv = _cap_inv()
+    a, b = inv
+    ident = PresetIdentifier({t: _embed_only_hit(a, b) for t in (b"c1", b"c2")})
+    dets = [PageDetection(page_index=0, bag_marker=1, callouts=[_callout(1, b"c1"), _callout(1, b"c2")])]
+    out = tmp_path / "crops"
+
+    assemble_result(dets, inv, ident, num_pages=1, use_color=False,
+                    capacity_reconcile=True, dump_crops_dir=out)
+
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    # One crop stayed on the attractor A1; the diverted one records A1 as its
+    # raw winner but B2 as its final assignment.
+    finals = sorted(e["part_num"] for e in manifest)
+    assert finals == ["A1", "B2"]
+    diverted = next(e for e in manifest if e["part_num"] == "B2")
+    assert diverted["raw_part_num"] == "A1"
+    assert (out / "B2").is_dir()
+
+
+def test_no_dump_dir_writes_nothing(tmp_path):
+    inv = _inv()
+    detections = [PageDetection(page_index=0, bag_marker=1, callouts=[_callout(1, b"red")])]
+    ident = FakeIdentifier(inv, {b"red": (0, 0.9)})
+    assemble_result(detections, inv, ident, num_pages=1, use_color=False)
+    assert list(tmp_path.iterdir()) == []  # default: no side effects
+
+
 def test_capacity_reconcile_can_be_disabled():
     inv = _cap_inv()
     a, b = inv

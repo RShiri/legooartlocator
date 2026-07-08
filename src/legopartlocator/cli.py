@@ -92,6 +92,9 @@ def main() -> None:
 @click.option("--capacity-reconcile/--no-capacity-reconcile", default=True, show_default=True,
               help="[local engine] Stop an embedding-only match from over-filling a part past its inventory quantity "
                    "(diverts the attractor's spurious extra crops); reduces count-mismatch warnings.")
+@click.option("--dump-crops", "dump_crops_dir", type=click.Path(file_okay=False), default=None,
+              help="[local engine] Write every callout crop + a manifest.json (assignment, per-signal scores) "
+                   "to this directory — a labelled dataset for calibration, diagnosis, and --real-crops training.")
 @click.option("--locale", default="en-gb", show_default=True, help="LEGO site locale for auto-download (e.g. en-us, de-de).")
 @click.option("--booklet", type=int, default=1, show_default=True, help="Which booklet to scan when a set has several.")
 @click.option("--download-dir", default=".", show_default=True, help="Where to save auto-downloaded PDFs.")
@@ -117,6 +120,7 @@ def scan(
     embeddings: bool,
     embedding_weights: Optional[str],
     capacity_reconcile: bool,
+    dump_crops_dir: Optional[str],
     locale: str,
     booklet: int,
     download_dir: str,
@@ -144,7 +148,8 @@ def scan(
             raise click.UsageError("--engine local requires a PDF path or --set to auto-download.")
         _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
                    no_brickognize, embeddings, embedding_weights, capacity_reconcile,
-                   no_rebrickable, out_dir, cache_dir, no_cache, panel_low, panel_high)
+                   dump_crops_dir, no_rebrickable, out_dir, cache_dir, no_cache,
+                   panel_low, panel_high)
         return
 
     if not pdf and not extracts:
@@ -404,7 +409,8 @@ def _autofetch_pdf(set_num, locale, booklet, download_dir):
 
 def _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
                no_brickognize, embeddings, embedding_weights, capacity_reconcile,
-               no_rebrickable, out_dir, cache_dir, no_cache, panel_low, panel_high):
+               dump_crops_dir, no_rebrickable, out_dir, cache_dir, no_cache,
+               panel_low, panel_high):
     """Local engine: detect callouts with OpenCV, identify with the free ensemble."""
     from .brickognize import BrickognizeClient
     from .inventory import load_inventory_file
@@ -506,7 +512,7 @@ def _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
     result = locate_local(
         pdf, inventory or [], identifier, dpi=dpi, page_spec=page_spec, max_pages=max_pages,
         detector=detector, use_color=True, reconcile_counts=reconcile_counts,
-        capacity_reconcile=capacity_reconcile,
+        capacity_reconcile=capacity_reconcile, dump_crops_dir=dump_crops_dir,
         set_num=set_num, set_name=set_name, progress=progress,
     )
     click.echo("")

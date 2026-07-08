@@ -56,16 +56,17 @@ def _resolve_assignments(
     to unknown if none qualifies. A Brickognize-corroborated winner is never
     diverted, so genuinely repeated parts are preserved.
 
-    ``pending`` items are ``(bag, page_index, qty, seen_color, IdentificationResult)``.
+    ``pending`` items are
+    ``(bag, page_index, qty, seen_color, crop_png, IdentificationResult)``.
     """
     if not capacity_reconcile:
-        return [(r.part, r.confidence) for (_b, _p, _q, _c, r) in pending]
+        return [(r.part, r.confidence) for (_b, _p, _q, _c, _png, r) in pending]
 
-    order = sorted(range(len(pending)), key=lambda i: pending[i][4].confidence, reverse=True)
+    order = sorted(range(len(pending)), key=lambda i: pending[i][5].confidence, reverse=True)
     assigned_qty: Dict[str, int] = {}
     out: List[Tuple[Optional[InventoryPart], float]] = [(None, 0.0)] * len(pending)
     for i in order:
-        _bag, _page, qty, _color, res = pending[i]
+        _bag, _page, qty, _color, _png, res = pending[i]
         if res.part is None:
             continue
         # Winner first, then the ranked alternatives as fallback homes.
@@ -86,6 +87,59 @@ def _resolve_assignments(
             assigned_qty[key] = assigned_qty.get(key, 0) + qty
             break
     return out
+
+
+def _dump_crops(
+    pending: List[tuple],
+    assignments: List[Tuple[Optional[InventoryPart], float]],
+    dump_dir,
+) -> None:
+    """Persist every callout crop with its assignment metadata.
+
+    Writes ``dump_dir/<part_num or 'unknown'>/pNNN_iNNN.png`` per crop plus one
+    ``dump_dir/manifest.json`` describing them all — the labelled dataset that
+    downstream work needs: embedding-floor calibration (score distributions),
+    real-crop self-training (corroborated crops as in-domain labels), and the
+    detection-miss vs. identification-miss diagnosis (what's in ``unknown/``).
+    """
+    import json
+    from pathlib import Path as _Path
+
+    out = _Path(dump_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for i, ((bag, page_index, qty, seen_color, crop_png, res), (part, confidence)) in enumerate(
+        zip(pending, assignments)
+    ):
+        label = part.part_num if part is not None and part.part_num else "unknown"
+        rel = None
+        if crop_png:
+            sub = out / label
+            sub.mkdir(parents=True, exist_ok=True)
+            rel = f"{label}/p{page_index:03d}_i{i:03d}.png"
+            (out / rel).write_bytes(crop_png)
+        entries.append(
+            {
+                "file": rel,  # None when the crop had no PNG bytes
+                "page_index": page_index,  # 0-based
+                "bag": bag,
+                "quantity": qty,
+                "seen_color": seen_color,
+                "part_num": part.part_num if part is not None else None,
+                "color_name": part.color_name if part is not None else None,
+                # The identifier's raw winner, before capacity-reconcile — differs
+                # from part_num when the crop was diverted.
+                "raw_part_num": res.part.part_num if res.part is not None else None,
+                "confidence": float(confidence),
+                "components": {k: float(v) for k, v in res.components.items()},
+                "alternatives": [
+                    [p.part_num, float(s)] for p, s in res.alternatives[:2]
+                ],
+            }
+        )
+    (out / "manifest.json").write_text(
+        json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
 
 def make_identifier(
@@ -116,6 +170,7 @@ def assemble_result(
     use_color: bool = True,
     reconcile_counts: bool = True,
     capacity_reconcile: bool = True,
+    dump_crops_dir=None,
     source_pdf: Optional[str] = None,
     set_num: Optional[str] = None,
     set_name: Optional[str] = None,
@@ -134,7 +189,7 @@ def assemble_result(
 
     # Phase 1: identify every crop, collecting reads without bucketing yet, so
     # capacity-reconcile (phase 2) can resolve them in confidence order.
-    pending: List[tuple] = []  # (bag, page_index, qty, seen_color, IdentificationResult)
+    pending: List[tuple] = []  # (bag, page_index, qty, seen_color, crop_png, IdentificationResult)
     identify_failures = 0
     identify_failure_msgs: List[str] = []
 
@@ -157,17 +212,20 @@ def assemble_result(
                 if len(identify_failure_msgs) < 3 and msg not in identify_failure_msgs:
                     identify_failure_msgs.append(msg)
                 result = IdentificationResult(part=None, confidence=0.0)
-            pending.append((bag, det.page_index, dc.callout.quantity, seen_color, result))
+            pending.append((bag, det.page_index, dc.callout.quantity, seen_color, dc.crop_png, result))
 
     # Phase 2: resolve each crop's winner (optionally capacity/trust-aware),
     # then bucket into LocatedParts exactly as before.
     assignments = _resolve_assignments(pending, capacity_reconcile and reconcile_counts)
 
+    if dump_crops_dir is not None:
+        _dump_crops(pending, assignments, dump_crops_dir)
+
     by_key: Dict[str, LocatedPart] = {}
     conf_acc: Dict[str, List[float]] = {}
     unidentified = 0
 
-    for (bag, page_index, qty, seen_color, _result), (part, confidence) in zip(pending, assignments):
+    for (bag, page_index, qty, seen_color, _png, _result), (part, confidence) in zip(pending, assignments):
         if part is not None:
             key = _inv_key(part)
             lp = by_key.get(key)
@@ -240,6 +298,7 @@ def locate_local(
     use_color: bool = True,
     reconcile_counts: bool = True,
     capacity_reconcile: bool = True,
+    dump_crops_dir=None,
     set_num: Optional[str] = None,
     set_name: Optional[str] = None,
     progress=None,
@@ -270,7 +329,7 @@ def locate_local(
     result = assemble_result(
         detections, inventory, identifier, total,
         use_color=use_color, reconcile_counts=reconcile_counts,
-        capacity_reconcile=capacity_reconcile,
+        capacity_reconcile=capacity_reconcile, dump_crops_dir=dump_crops_dir,
         source_pdf=str(pdf_path), set_num=set_num, set_name=set_name,
     )
     result.warnings.extend(ordinal_warnings)
