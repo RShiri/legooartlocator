@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Protocol, Sequence, Tuple, Union, runtime_checkable
+from typing import Dict, List, Optional, Protocol, Sequence, Tuple, Union, runtime_checkable
 
 import cv2
 import numpy as np
@@ -254,6 +254,133 @@ def _parse_pure_int(text: str) -> Optional[int]:
         except ValueError:
             return None
     return None
+
+
+class DigitOCR:
+    """Dependency-free reader for the small 'Nx' quantity label in a callout cell.
+
+    LEGO callouts print the piece count as small near-black text ("1x", "2x")
+    on a light baseline below the part render. Tesseract can read it but isn't
+    always installed; this backend finds that label as a horizontal row of small
+    dark glyphs low in the cell and template-matches each glyph against digit/x
+    templates rendered with cv2 (no font file, no extra dependency). Returns
+    "<n>x" for :func:`_parse_quantity`, or "" when no label is confidently found
+    (so the quantity falls back to 1, exactly like the null-OCR path).
+
+    A large single numeral (a bag-start marker) does not match the small-glyph
+    row pattern and returns "" -> ordinal bag numbering is unaffected, so this
+    is safe to use as the detector's only OCR.
+    """
+
+    _CANON = 28  # canonical glyph box (px) used for template matching
+
+    def __init__(self) -> None:
+        self._templates: Optional[Dict[str, np.ndarray]] = None
+
+    def read_text(self, image_bgr: np.ndarray) -> str:
+        try:
+            return self._read(image_bgr)
+        except Exception:  # pragma: no cover - defensive; never break a scan on a bad crop
+            return ""
+
+    def _canon(self, binary: np.ndarray) -> np.ndarray:
+        """Crop a binary glyph to its ink bbox and fit it into a canonical square
+        *preserving aspect ratio* (scale the longer side to CANON, then centre-
+        pad). Stretching to a square would turn a thin '1' into a blob and wreck
+        digit discrimination, so aspect must be kept."""
+        ys, xs = np.where(binary)
+        if xs.size == 0:
+            return np.zeros((self._CANON, self._CANON), dtype=bool)
+        crop = binary[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1].astype(np.uint8)
+        ch, cw = crop.shape
+        scale = self._CANON / max(ch, cw)
+        nh, nw = max(1, round(ch * scale)), max(1, round(cw * scale))
+        resized = cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_AREA)
+        out = np.zeros((self._CANON, self._CANON), dtype=np.uint8)
+        y0, x0 = (self._CANON - nh) // 2, (self._CANON - nw) // 2
+        out[y0 : y0 + nh, x0 : x0 + nw] = resized
+        return out > 0.5
+
+    def _build_templates(self) -> Dict[str, np.ndarray]:
+        templates: Dict[str, np.ndarray] = {}
+        for ch in "0123456789x":
+            canvas = np.zeros((64, 64), dtype=np.uint8)
+            cv2.putText(canvas, ch, (14, 48), cv2.FONT_HERSHEY_DUPLEX, 1.5, 255, 3, cv2.LINE_AA)
+            templates[ch] = self._canon(canvas > 127)
+        return templates
+
+    def _match(self, glyph: np.ndarray) -> Tuple[str, float]:
+        """Best (char, IoU score) for a binary glyph against the templates."""
+        if self._templates is None:
+            self._templates = self._build_templates()
+        g = self._canon(glyph)
+        best_ch, best_score = "", -1.0
+        for ch, tmpl in self._templates.items():
+            union = np.logical_or(g, tmpl).sum()
+            score = float(np.logical_and(g, tmpl).sum()) / float(union) if union else 0.0
+            if score > best_score:
+                best_ch, best_score = ch, score
+        return best_ch, best_score
+
+    def _read(self, image_bgr: np.ndarray) -> str:
+        if image_bgr is None or getattr(image_bgr, "ndim", 0) < 2:
+            return ""
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY) if image_bgr.ndim == 3 else image_bgr
+        h, w = gray.shape[:2]
+        if h < 24 or w < 24:
+            return ""
+
+        dark = (gray < 70).astype(np.uint8)
+        glyphs = []  # (x, y, gw, gh, binary_crop)
+        for contour in _find_contours(dark):
+            x, y, gw, gh = cv2.boundingRect(contour)
+            if gh < max(8, 0.08 * h) or gh > 0.5 * h:
+                continue  # too small to read / too tall to be a label glyph
+            if gw < 3 or gw > 0.3 * w:
+                continue  # column rules / part-render spans
+            fill = cv2.contourArea(contour) / (gw * gh + 1e-6)
+            if fill < 0.10 or fill > 0.98:
+                continue
+            if (y + gh / 2) < 0.4 * h:
+                continue  # the label sits low in the cell, under the part
+            glyphs.append((x, y, gw, gh, dark[y : y + gh, x : x + gw].astype(bool)))
+        if not glyphs:
+            return ""
+
+        # Cluster glyphs into horizontal rows by baseline proximity.
+        rows: list = []
+        for g in sorted(glyphs, key=lambda e: e[1] + e[3] / 2):
+            cy, gh = g[1] + g[3] / 2, g[3]
+            for row in rows:
+                rcy = np.mean([e[1] + e[3] / 2 for e in row])
+                rh = np.mean([e[3] for e in row])
+                if abs(cy - rcy) < 0.6 * max(gh, rh):
+                    row.append(g)
+                    break
+            else:
+                rows.append([g])
+
+        # Read each plausible row; keep the lowest one that parses as "<n>x".
+        best, best_cy = "", -1.0
+        for row in rows:
+            if not (2 <= len(row) <= 6):
+                continue
+            chars, ok = [], True
+            for g in sorted(row, key=lambda e: e[0]):
+                ch, score = self._match(g[4])
+                if score < 0.25:
+                    ok = False
+                    break
+                chars.append(ch)
+            if not ok:
+                continue
+            text = "".join(chars)
+            if not _QTY_RE.search(text):
+                continue
+            rcy = float(np.mean([g[1] + g[3] / 2 for g in row]))
+            if rcy > best_cy:
+                best, best_cy = text, rcy
+        return best
 
 
 def _should_merge_glyphs(

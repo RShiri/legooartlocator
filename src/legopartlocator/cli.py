@@ -44,27 +44,26 @@ def _load_extracts(path: str) -> List[PageExtract]:
     return [PageExtract(**d) for d in data]
 
 
-def _tesseract_or_null_ocr():
-    """Return None (use the default TesseractOCR) if the binary is present,
-    else a no-op OCR plus a warning. Quantities default to 1 without it, but
-    bag numbers still work — they're assigned ordinally (see locate.py)."""
+def _tesseract_or_digit_ocr():
+    """Return None (use the default TesseractOCR) if the binary is present, else
+    a dependency-free ``DigitOCR`` that reads the 'Nx' quantity label by digit
+    template-matching. Bag numbers still work either way — they're assigned
+    ordinally (see locate.py); DigitOCR returns "" for the large bag numeral so
+    that path is unchanged. Printed part ids still need Tesseract."""
     import shutil
 
     if shutil.which("tesseract") is not None:
         return None
 
+    from .vision_local import DigitOCR
+
     click.echo(
-        "Tesseract binary not found: quantities default to 1. Bag numbers are "
-        "still assigned (ordinally, from detected bag-start pages). Install "
-        "Tesseract to read quantities and any printed part ids.",
+        "Tesseract binary not found: reading quantities with the built-in digit "
+        "reader (the 'Nx' label). Bag numbers are assigned ordinally; install "
+        "Tesseract to also read printed part ids.",
         err=True,
     )
-
-    class _NullOCR:
-        def read_text(self, image_bgr):
-            return ""
-
-    return _NullOCR()
+    return DigitOCR()
 
 
 @click.group()
@@ -239,7 +238,7 @@ def debug(pdf: str, out_dir: str, page_spec: Optional[str], dpi: int,
     if panel_high is not None:
         config.panel_gray_high = panel_high
 
-    ocr = _tesseract_or_null_ocr()
+    ocr = _tesseract_or_digit_ocr()
 
     click.echo(f"Detecting on {pdf} at {dpi} DPI -> {out_dir} ...")
     stats = run_debug(pdf, out_dir, dpi=dpi, page_spec=page_spec, config=config, ocr=ocr)
@@ -491,7 +490,7 @@ def _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
     if panel_high is not None:
         config.panel_gray_high = panel_high
 
-    ocr = _tesseract_or_null_ocr()
+    ocr = _tesseract_or_digit_ocr()
     detector = LocalDetector(config=config, ocr=ocr) if (ocr or panel_low or panel_high) else None
 
     signals = ["colour"]

@@ -387,6 +387,26 @@ identifier correctly *declining* to place crops it can't corroborate. Not yet
 validated with embeddings on 76269 (the 5202-part gallery/training cost wasn't
 paid).
 
+### Follow-up — built-in quantity reader (the 'Nx' label): mismatches 11 → 7
+
+The remaining count-mismatch warnings were traced to real data: **every callout
+was counted as 1 piece** because no OCR backend was installed (Tesseract absent
+→ null OCR → quantity defaults to 1), so a callout printed "3x"/"6x" still
+counted as 1 — the dominant cause of the under-counts. Added `DigitOCR`
+(`vision_local.py`): a dependency-free reader that finds the small 'Nx' label as
+a low row of dark glyphs and template-matches each digit against cv2-rendered
+glyphs (no font file, no Tesseract). Wired in as the default OCR when Tesseract
+is absent (`_tesseract_or_digit_ocr` in cli.py); it returns "" for a large bag
+numeral, so ordinal bag numbering is unaffected.
+
+Calibrated on real 76307 crops (12/12) and validated on the real scan:
+count-mismatch warnings **11 → 7**, under-counts **6 → 2** (quantities now read
+as 2x/3x/4x). The remaining 7 are 5 over-counts of +1 (a part shown in one more
+step-illustration than its piece count — largely legitimate for a location tool)
+and 2 harder under-counts (a multi-occurrence part and a likely single misread).
+148 tests pass. 76307 overall: **baseline 31/47 & 12 warnings → 37/47 & 8
+warnings**.
+
 ## Immediate next step
 
 1. **[RESOLVED — shipped this session]** The training trade-off decision is
