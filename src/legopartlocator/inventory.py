@@ -56,13 +56,16 @@ def _to_part(row: dict) -> Optional[InventoryPart]:
     color_id_raw = _pick(row, "color_id")
     try:
         quantity = int(float(qty_raw)) if qty_raw is not None else 0
-    except ValueError:
+    except (ValueError, TypeError, OverflowError):
+        # OverflowError: a literal "inf"/"Infinity" quantity parses as a float
+        # fine but can't become an int. Same degrade-to-0 policy as any other
+        # malformed value in this real-world-export-tolerant loader.
         quantity = 0
     color_id = None
     if color_id_raw is not None:
         try:
             color_id = int(color_id_raw)
-        except ValueError:
+        except (ValueError, TypeError):
             color_id = None
     return InventoryPart(
         part_num=part_num,
@@ -87,8 +90,25 @@ def load_inventory_file(path: str | Path) -> List[InventoryPart]:
         raise FileNotFoundError(f"Inventory file not found: {p}")
 
     if p.suffix.lower() == ".json":
-        data = json.loads(p.read_text(encoding="utf-8"))
-        rows = data.get("results", data) if isinstance(data, dict) else data
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Inventory file {p} is not valid JSON: {exc}") from exc
+        if isinstance(data, dict):
+            if "results" not in data:
+                raise ValueError(
+                    f"Inventory file {p} is a JSON object with no 'results' key — expected "
+                    "either a plain list of inventory rows or a Rebrickable-style "
+                    "{'results': [...]} payload."
+                )
+            rows = data["results"]
+        else:
+            rows = data
+        if not isinstance(rows, list):
+            raise ValueError(
+                f"Inventory file {p}: expected a JSON list of inventory rows, "
+                f"got {type(rows).__name__}."
+            )
         parts: List[InventoryPart] = []
         for row in rows:
             # Support the nested Rebrickable shape as well as flat dicts.

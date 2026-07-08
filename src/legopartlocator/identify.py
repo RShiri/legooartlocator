@@ -20,8 +20,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-import numpy as np
-
 from .brickognize import BrickognizeClient
 from .embedding import EmbeddingBackend, Gallery
 from .models import InventoryPart

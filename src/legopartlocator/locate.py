@@ -13,7 +13,7 @@ identifier, no PDF/rendering needed). ``locate_local`` wraps it with rendering.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .bags import page_to_bag, segment_bags
 from .brickognize import BrickognizeClient

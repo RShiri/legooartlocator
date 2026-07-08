@@ -80,6 +80,23 @@ def _default_get_bytes(url: str) -> bytes:  # pragma: no cover - network
     return resp.content
 
 
+def _is_valid_pdf(path: Path) -> bool:
+    """True if ``path`` opens as a real PDF with at least one page.
+
+    Guards the skip-if-exists check below against reusing a truncated/corrupt
+    file left behind by an interrupted prior download -- without this, such a
+    file would be reused forever (never re-downloaded) and only fail much
+    later, deep inside PyMuPDF at render time, with no hint that a bad
+    download was the real cause.
+    """
+    try:
+        from .pdf_render import page_count
+
+        return page_count(path) > 0
+    except Exception:
+        return False
+
+
 class InstructionFetcher:
     """Fetches a set's instruction page and downloads its PDF booklets."""
 
@@ -104,7 +121,9 @@ class InstructionFetcher:
         """Download all booklet PDFs for a set; returns their local paths.
 
         Files are named by their CDN basename and skipped if already present
-        (unless ``overwrite``). Raises FetchError if the page lists no PDFs.
+        *and valid* (unless ``overwrite``) — a truncated/corrupt existing file
+        is re-downloaded rather than silently reused. Raises FetchError if the
+        page lists no PDFs.
         """
         urls = self.list_pdf_urls(set_num, locale)
         if not urls:
@@ -118,7 +137,7 @@ class InstructionFetcher:
         paths: List[Path] = []
         for url in urls:
             out = dest / url.rsplit("/", 1)[-1]
-            if overwrite or not out.exists():
+            if overwrite or not out.exists() or not _is_valid_pdf(out):
                 out.write_bytes(self.get_bytes(url))
             paths.append(out)
         return paths

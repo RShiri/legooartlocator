@@ -29,7 +29,7 @@ import numpy as np
 
 from .detection import PageDetection
 from .pdf_render import page_count, parse_page_range, render_pages
-from .vision_local import DetectConfig, ImageInput, LocalDetector, OCR
+from .vision_local import OCR, DetectConfig, ImageInput, LocalDetector
 
 # BGR colours (OpenCV convention).
 _RED = (0, 0, 255)
@@ -169,6 +169,14 @@ def run_debug(
     (panel threshold mask) per rendered page, plus ``stats.json`` holding the
     same dict this function returns -- ``{"pdf", "dpi", "pages": [...]}`` --
     so thresholds can be tuned by eye against a real manual.
+
+    One page's failure (a decode error, an unexpected detector exception) is
+    recorded as ``{"page_index", "error"}`` in ``pages`` and does not abort the
+    rest of the run -- this is exactly the calibration tool meant to survive a
+    real, imperfect scanned manual, so one bad page losing every other page's
+    output would defeat its purpose. ``stats.json`` is (re)written after every
+    page, not just at the end, so progress already made survives even if a
+    later page crashes hard enough to abort the process entirely.
     """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -177,15 +185,26 @@ def run_debug(
     indices = parse_page_range(page_spec, page_count(pdf_path))
 
     pages_stats: List[Dict[str, Any]] = []
+
+    def _write_stats() -> Dict[str, Any]:
+        result = {"pdf": str(pdf_path), "dpi": dpi, "pages": pages_stats}
+        (out / "stats.json").write_text(json.dumps(result, indent=2))
+        return result
+
     for rendered in render_pages(pdf_path, dpi=dpi, page_indices=indices):
         idx = rendered.page_index
-        img = _as_bgr(rendered.png_bytes)
-        detection = det.detect_page(rendered.png_bytes, idx)
+        try:
+            img = _as_bgr(rendered.png_bytes)
+            if img is None:
+                raise ValueError("could not decode rendered page image")
+            detection = det.detect_page(rendered.png_bytes, idx)
 
-        (out / f"page_{idx:03d}.png").write_bytes(draw_overlay(img, detection))
-        (out / f"mask_{idx:03d}.png").write_bytes(panel_mask(img, det.config))
-        pages_stats.append(page_stats(detection, img.shape))
+            (out / f"page_{idx:03d}.png").write_bytes(draw_overlay(img, detection))
+            (out / f"mask_{idx:03d}.png").write_bytes(panel_mask(img, det.config))
+            pages_stats.append(page_stats(detection, img.shape))
+        except Exception as exc:  # noqa: BLE001 - isolate one bad page, keep going
+            pages_stats.append({"page_index": idx, "error": str(exc)})
+        finally:
+            _write_stats()
 
-    result = {"pdf": str(pdf_path), "dpi": dpi, "pages": pages_stats}
-    (out / "stats.json").write_text(json.dumps(result, indent=2))
-    return result
+    return _write_stats()

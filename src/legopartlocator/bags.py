@@ -29,15 +29,26 @@ def _collect_markers(pages: List[PageExtract]) -> List[Tuple[int, int]]:
 
 
 def _filter_monotonic(markers: List[Tuple[int, int]]) -> Tuple[List[Tuple[int, int]], List[str]]:
-    """Keep only markers whose bag number strictly increases; drop the rest as suspect."""
+    """Keep only markers whose bag number strictly increases; drop the rest.
+
+    A marker repeating the *current* bag (e.g. a reprinted bag banner) is
+    expected/harmless, not a detection anomaly -- it gets its own, calmer
+    message so it doesn't read like the same problem as a marker that
+    actually goes backwards (a real misread/out-of-order page).
+    """
     kept: List[Tuple[int, int]] = []
     warnings: List[str] = []
     last_bag = 0
     for page_index, bag in markers:
-        if bag <= last_bag:
+        if bag == last_bag:
+            warnings.append(
+                f"Bag marker {bag} repeated on page {page_index + 1} (same as the current bag); ignored."
+            )
+            continue
+        if bag < last_bag:
             warnings.append(
                 f"Ignored suspect bag marker {bag} on page {page_index + 1} "
-                f"(not greater than previous bag {last_bag})."
+                f"(less than previous bag {last_bag})."
             )
             continue
         kept.append((page_index, bag))

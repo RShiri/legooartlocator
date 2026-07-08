@@ -40,8 +40,16 @@ def _load_dotenv(path: str = ".env") -> None:
 
 
 def _load_extracts(path: str) -> List[PageExtract]:
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    return [PageExtract(**d) for d in data]
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise click.UsageError(f"--extracts file {path!r} is not valid JSON: {exc}") from exc
+    if not isinstance(data, list):
+        raise click.UsageError(f"--extracts file {path!r} must contain a JSON list of page extracts.")
+    try:
+        return [PageExtract(**d) for d in data]
+    except Exception as exc:
+        raise click.UsageError(f"--extracts file {path!r} has an invalid page extract: {exc}") from exc
 
 
 def _tesseract_or_digit_ocr():
@@ -146,10 +154,13 @@ def scan(
     if engine == "local":
         if not pdf:
             raise click.UsageError("--engine local requires a PDF path or --set to auto-download.")
-        _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
-                   no_brickognize, embeddings, embedding_weights, capacity_reconcile,
-                   dump_crops_dir, no_rebrickable, out_dir, cache_dir, no_cache,
-                   panel_low, panel_high)
+        try:
+            _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
+                       no_brickognize, embeddings, embedding_weights, capacity_reconcile,
+                       dump_crops_dir, no_rebrickable, out_dir, cache_dir, no_cache,
+                       panel_low, panel_high)
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
         return
 
     if not pdf and not extracts:
@@ -161,11 +172,25 @@ def scan(
     if extracts:
         page_extracts = _load_extracts(extracts)
         num_pages = max((p.page_index for p in page_extracts), default=-1) + 1
+        if page_spec or max_pages is not None:
+            from .pdf_render import parse_page_range
+
+            try:
+                indices = parse_page_range(page_spec, num_pages)
+            except ValueError as exc:
+                raise click.UsageError(str(exc)) from exc
+            if max_pages is not None:
+                indices = indices[:max_pages]
+            wanted = set(indices)
+            page_extracts = [p for p in page_extracts if p.page_index in wanted]
         click.echo(f"Loaded {len(page_extracts)} page extracts from {extracts}.")
     else:
-        page_extracts, num_pages = _render_and_extract(
-            pdf, page_spec, max_pages, dpi, triage_dpi, single_pass, cache_dir, no_cache
-        )
+        try:
+            page_extracts, num_pages = _render_and_extract(
+                pdf, page_spec, max_pages, dpi, triage_dpi, single_pass, cache_dir, no_cache
+            )
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
 
     # 2. Resolve set number (needed for reconciliation).
     if not set_num and pdf:
@@ -246,7 +271,10 @@ def debug(pdf: str, out_dir: str, page_spec: Optional[str], dpi: int,
     ocr = _tesseract_or_digit_ocr()
 
     click.echo(f"Detecting on {pdf} at {dpi} DPI -> {out_dir} ...")
-    stats = run_debug(pdf, out_dir, dpi=dpi, page_spec=page_spec, config=config, ocr=ocr)
+    try:
+        stats = run_debug(pdf, out_dir, dpi=dpi, page_spec=page_spec, config=config, ocr=ocr)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
     n_pages = len(stats.get("pages", []))
     total_callouts = sum(p.get("n_callouts", 0) for p in stats.get("pages", []))
     click.echo(f"Wrote {n_pages} page(s) of overlays/masks + stats.json to {out_dir}.")
@@ -323,7 +351,10 @@ def train_embedding(
     from .inventory import load_inventory_file
 
     if inventory_file:
-        inventory = load_inventory_file(inventory_file)
+        try:
+            inventory = load_inventory_file(inventory_file)
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
         click.echo(f"Loaded {len(inventory)} inventory lines from {inventory_file}.")
     elif set_num:
         inventory, _set_name = _fetch_inventory(set_num)
@@ -385,7 +416,7 @@ def train_embedding(
 
 
 def _render_and_extract(pdf, page_spec, max_pages, dpi, triage_dpi, single_pass, cache_dir, no_cache):
-    from .pdf_render import PageRenderer, parse_page_range, page_count, render_pages
+    from .pdf_render import PageRenderer, page_count, parse_page_range, render_pages
     from .vision import VisionExtractor, extract_pages, extract_pages_two_pass
 
     total = page_count(pdf)
@@ -474,7 +505,10 @@ def _run_local(pdf, set_num, page_spec, max_pages, dpi, inventory_file,
     inventory = None
     set_name = None
     if inventory_file:
-        inventory = load_inventory_file(inventory_file)
+        try:
+            inventory = load_inventory_file(inventory_file)
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
         click.echo(f"Loaded {len(inventory)} inventory lines from {inventory_file}.")
     elif set_num and not no_rebrickable:
         inventory, set_name = _fetch_inventory(set_num)

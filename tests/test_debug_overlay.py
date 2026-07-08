@@ -176,3 +176,50 @@ def test_run_debug_writes_overlays_masks_and_stats(tmp_path):
 
     on_disk = json.loads((out_dir / "stats.json").read_text())
     assert on_disk == result
+
+
+class _FlakyDetector:
+    """Wraps a real detector but raises on a chosen page index -- simulates an
+    unexpected detection failure on one page of an otherwise-fine manual."""
+
+    def __init__(self, real, fail_on: int):
+        self._real = real
+        self._fail_on = fail_on
+
+    def detect_page(self, png_bytes, page_index):
+        if page_index == self._fail_on:
+            raise RuntimeError("boom")
+        return self._real.detect_page(png_bytes, page_index)
+
+    @property
+    def config(self):
+        return self._real.config
+
+
+def test_run_debug_isolates_one_bad_page_and_keeps_the_rest(tmp_path):
+    from legopartlocator.vision_local import LocalDetector
+
+    pdf_path = tmp_path / "tiny.pdf"
+    _make_two_page_pdf(pdf_path)
+    out_dir = tmp_path / "debug_out"
+
+    real = LocalDetector(config=DetectConfig(), ocr=FakeOCR(text=""))
+    flaky = _FlakyDetector(real, fail_on=1)
+
+    result = run_debug(pdf_path, out_dir, dpi=150, detector=flaky)
+
+    # Page 0 succeeded: its files exist and its stats are normal.
+    assert (out_dir / "page_000.png").exists()
+    assert (out_dir / "mask_000.png").exists()
+    page0 = next(p for p in result["pages"] if p["page_index"] == 0)
+    assert "error" not in page0
+
+    # Page 1 failed: no output files for it, but it's recorded, not fatal.
+    assert not (out_dir / "page_001.png").exists()
+    assert not (out_dir / "mask_001.png").exists()
+    page1 = next(p for p in result["pages"] if p["page_index"] == 1)
+    assert page1["error"] == "boom"
+
+    # stats.json on disk always reflects everything processed so far.
+    on_disk = json.loads((out_dir / "stats.json").read_text())
+    assert on_disk == result

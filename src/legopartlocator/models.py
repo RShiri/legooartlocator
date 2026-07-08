@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class PageCallout(BaseModel):
@@ -48,6 +48,17 @@ class BagSegment(BaseModel):
     bag: int = Field(..., description="Bag number. 0 is used for pre-bag intro pages.")
     start_page: int = Field(..., ge=0, description="First 0-based page index (inclusive).")
     end_page: int = Field(..., ge=0, description="Last 0-based page index (inclusive).")
+
+    @model_validator(mode="after")
+    def _check_page_order(self) -> "BagSegment":
+        # An inverted segment would make page_to_bag's range(start, end+1)
+        # silently return empty, dropping the page from the bag mapping with
+        # no warning -- catch it at construction instead.
+        if self.end_page < self.start_page:
+            raise ValueError(
+                f"BagSegment.end_page ({self.end_page}) must be >= start_page ({self.start_page})"
+            )
+        return self
 
     def contains(self, page_index: int) -> bool:
         return self.start_page <= page_index <= self.end_page

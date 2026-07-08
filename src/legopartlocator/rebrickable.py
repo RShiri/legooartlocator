@@ -53,17 +53,38 @@ class RebrickableClient:
             )
         return {"Authorization": f"key {self.api_key}", "Accept": "application/json"}
 
+    def _get(self, client, url: str, headers: dict, set_num: str):
+        """GET ``url``, raising ``RebrickableError`` for every failure mode --
+        a 404, any other non-2xx status, or a transport-level error (bad key,
+        rate limit, timeout, connection failure) -- so callers (cli.py's
+        ``_fetch_inventory``) can catch one exception type and fall back to
+        vision-only, instead of a raw httpx exception crashing the scan."""
+        try:
+            resp = client.get(url, headers=headers)
+        except Exception as exc:  # noqa: BLE001 - any transport failure, not just HTTPStatusError
+            raise RebrickableError(f"Rebrickable request failed: {exc}") from exc
+        if resp.status_code == 404:
+            raise RebrickableError(f"Set {set_num} not found on Rebrickable.")
+        try:
+            resp.raise_for_status()
+        except Exception as exc:
+            raise RebrickableError(f"Rebrickable request failed: {exc}") from exc
+        return resp
+
     def get_set_info(self, set_num: str) -> dict:
         client = self._get_client()
         url = f"{self.base_url}/lego/sets/{normalize_set_num(set_num)}/"
-        resp = client.get(url, headers=self._headers())
-        if resp.status_code == 404:
-            raise RebrickableError(f"Set {set_num} not found on Rebrickable.")
-        resp.raise_for_status()
+        resp = self._get(client, url, self._headers(), set_num)
         return resp.json()
 
-    def get_set_parts(self, set_num: str, page_size: int = 1000) -> List[InventoryPart]:
-        """Fetch the full inventory, following pagination."""
+    def get_set_parts(
+        self, set_num: str, page_size: int = 1000, max_pages: int = 1000
+    ) -> List[InventoryPart]:
+        """Fetch the full inventory, following pagination.
+
+        ``max_pages`` bounds the ``next``-link loop so a misbehaving API
+        response (an unexpected pagination cycle) can't hang forever.
+        """
         client = self._get_client()
         url: Optional[str] = (
             f"{self.base_url}/lego/sets/{normalize_set_num(set_num)}/parts/"
@@ -71,11 +92,15 @@ class RebrickableClient:
         )
         parts: List[InventoryPart] = []
         headers = self._headers()
+        pages = 0
         while url:
-            resp = client.get(url, headers=headers)
-            if resp.status_code == 404:
-                raise RebrickableError(f"Set {set_num} not found on Rebrickable.")
-            resp.raise_for_status()
+            pages += 1
+            if pages > max_pages:
+                raise RebrickableError(
+                    f"Rebrickable pagination exceeded {max_pages} pages for set {set_num} "
+                    "(unexpected 'next' link loop)."
+                )
+            resp = self._get(client, url, headers, set_num)
             payload = resp.json()
             for row in payload.get("results", []):
                 parts.append(_row_to_inventory_part(row))
@@ -86,12 +111,16 @@ class RebrickableClient:
 def _row_to_inventory_part(row: dict) -> InventoryPart:
     part = row.get("part") or {}
     color = row.get("color") or {}
+    try:
+        quantity = int(row.get("quantity", 0))
+    except (TypeError, ValueError, OverflowError):
+        quantity = 0
     return InventoryPart(
         part_num=part.get("part_num", ""),
         name=part.get("name", ""),
         color_id=color.get("id"),
         color_name=color.get("name"),
-        quantity=int(row.get("quantity", 0)),
+        quantity=quantity,
         element_id=row.get("element_id"),
         image_url=part.get("part_img_url"),
     )

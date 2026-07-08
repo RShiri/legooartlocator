@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import base64
 import os
-from typing import List, Optional
+import time
+from typing import Callable, List, Optional
 
 from .cache import JSONCache, content_hash
 from .models import PageCallout, PageExtract
@@ -158,12 +159,22 @@ class VisionExtractor:
         triage_model: str = DEFAULT_TRIAGE_MODEL,
         api_key: Optional[str] = None,
         client=None,
+        max_retries: int = 3,
+        backoff: float = 0.5,
+        sleep: Callable[[float], None] = time.sleep,
     ):
         self.cache = cache
         self.model = model  # detailed pass
         self.triage_model = triage_model  # cheap pass
         self._client = client
         self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        # A manual scan calls the API once per page (hundreds for a big
+        # booklet); retry transient failures with backoff rather than losing
+        # the whole scan to one hiccup, mirroring brickognize.py's
+        # BrickognizeClient (max_retries/backoff/injectable sleep).
+        self.max_retries = max_retries
+        self.backoff = backoff
+        self._sleep = sleep
 
     def _get_client(self):
         if self._client is not None:
@@ -183,6 +194,23 @@ class VisionExtractor:
     def _cache_key(self, png_bytes: bytes) -> str:
         return content_hash(png_bytes)
 
+    def _create_with_retry(self, **kwargs):
+        """``client.messages.create(**kwargs)`` retried with exponential
+        backoff on transport/API failures (mirrors brickognize.py's
+        BrickognizeClient.predict retry loop)."""
+        client = self._get_client()
+        last_exc: Optional[Exception] = None
+        for attempt in range(self.max_retries):
+            try:
+                return client.messages.create(**kwargs)
+            except Exception as exc:  # noqa: BLE001 - any API/transport failure is retryable
+                last_exc = exc
+                if attempt < self.max_retries - 1:
+                    self._sleep(self.backoff * (2**attempt))
+        raise VisionError(
+            f"Claude vision call failed after {self.max_retries} attempts: {last_exc}"
+        ) from last_exc
+
     def extract_page(self, page: RenderedPage, use_cache: bool = True) -> PageExtract:
         namespace = f"vision-{PROMPT_VERSION}-{self.model}"
         key = self._cache_key(page.png_bytes)
@@ -196,9 +224,8 @@ class VisionExtractor:
         return _extract_from_dict(page.page_index, data)
 
     def _call_model(self, png_bytes: bytes) -> dict:
-        client = self._get_client()
         b64 = base64.standard_b64encode(png_bytes).decode("ascii")
-        message = client.messages.create(
+        message = self._create_with_retry(
             model=self.model,
             max_tokens=2048,
             system=_SYSTEM,
@@ -239,9 +266,8 @@ class VisionExtractor:
         return data
 
     def _call_triage_model(self, png_bytes: bytes) -> dict:
-        client = self._get_client()
         b64 = base64.standard_b64encode(png_bytes).decode("ascii")
-        message = client.messages.create(
+        message = self._create_with_retry(
             model=self.triage_model,
             max_tokens=512,
             system=_TRIAGE_SYSTEM,

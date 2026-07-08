@@ -41,6 +41,11 @@ def parse_page_range(spec: Optional[str], num_pages: int) -> List[int]:
     """Parse a 1-based, inclusive range spec like "1-10,15,20-22" into 0-based indices.
 
     ``None`` or empty returns all pages. Out-of-bounds values are clamped/ignored.
+
+    Raises ``ValueError`` (with the offending chunk and the full spec, for a
+    clear user-facing message) on a non-integer chunk or a reversed range
+    (e.g. "50-10") -- both are almost certainly a typo, not intentional, and
+    silently producing zero pages or a raw traceback would hide that.
     """
     if not spec:
         return list(range(num_pages))
@@ -51,9 +56,23 @@ def parse_page_range(spec: Optional[str], num_pages: int) -> List[int]:
             continue
         if "-" in chunk:
             lo_s, hi_s = chunk.split("-", 1)
-            lo, hi = int(lo_s), int(hi_s)
+            try:
+                lo, hi = int(lo_s), int(hi_s)
+            except ValueError:
+                raise ValueError(
+                    f"invalid page range {chunk!r} in --pages spec {spec!r}: not integers"
+                ) from None
+            if lo > hi:
+                raise ValueError(
+                    f"invalid page range {chunk!r} in --pages spec {spec!r}: start > end"
+                )
         else:
-            lo = hi = int(chunk)
+            try:
+                lo = hi = int(chunk)
+            except ValueError:
+                raise ValueError(
+                    f"invalid page number {chunk!r} in --pages spec {spec!r}: not an integer"
+                ) from None
         for one_based in range(lo, hi + 1):
             zero_based = one_based - 1
             if 0 <= zero_based < num_pages:

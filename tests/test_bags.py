@@ -49,6 +49,24 @@ def test_suspect_out_of_order_marker_dropped():
     assert any("suspect bag marker" in w for w in warnings)
 
 
+def test_repeated_marker_for_current_bag_gets_a_calm_message_not_suspect():
+    # A reprinted "Bag 2" banner two pages in a row is expected/harmless --
+    # must not be worded like a real out-of-order anomaly.
+    pages = [
+        _page(0, bag=1),
+        _page(1, bag=2),
+        _page(2, bag=2),  # repeat of the current bag
+        _page(3, bag=3),
+    ]
+    segments, warnings = segment_bags(pages, num_pages=4)
+    mapping = page_to_bag(segments)
+
+    assert mapping[2] == 2  # stayed in bag 2
+    assert mapping[3] == 3
+    assert any("repeated" in w and "same as the current bag" in w for w in warnings)
+    assert not any("suspect" in w for w in warnings)
+
+
 def test_no_markers_falls_back_to_bag_zero():
     pages = [_page(0), _page(1), _page(2)]
     segments, warnings = segment_bags(pages, num_pages=3)
