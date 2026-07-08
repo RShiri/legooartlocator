@@ -274,6 +274,14 @@ def debug(pdf: str, out_dir: str, page_spec: Optional[str], dpi: int,
               help="'semihard' mines hard negatives from the current model each epoch instead of "
                    "sampling them at random (keeps gradient alive; ~2x epoch time on CPU). 'random' is "
                    "the original uniform sampling.")
+@click.option("--real-crops", "real_crops", multiple=True,
+              type=click.Path(exists=True, dir_okay=False),
+              help="manifest.json from `lpl scan --dump-crops` — corroborated real callout crops are "
+                   "added as in-domain training examples (repeatable).")
+@click.option("--ldraw-dir", "ldraw_dir", type=click.Path(exists=True, file_okay=False), default=None,
+              help="LDraw library root (the folder holding parts/ and p/, from ldraw.org complete.zip). "
+                   "Adds flat-shaded icon-style renders of each part as training images — the closest "
+                   "match to how instruction booklets actually draw parts.")
 @click.option("--batch-size", type=int, default=16, show_default=True)
 @click.option("--val-frac", type=float, default=0.25, show_default=True,
               help="Fraction of each part's variants held out to measure retrieval accuracy each epoch.")
@@ -283,7 +291,8 @@ def debug(pdf: str, out_dir: str, page_spec: Optional[str], dpi: int,
 def train_embedding(
     inventory_file: Optional[str], set_num: Optional[str], out_path: str, backbone: str,
     embedding_dim: int, epochs: int, variants_per_part: int, augment_style: str,
-    triplets_per_epoch: int, mining: str, batch_size: int, val_frac: float, patience: int, seed: int,
+    triplets_per_epoch: int, mining: str, real_crops: tuple, ldraw_dir: Optional[str],
+    batch_size: int, val_frac: float, patience: int, seed: int,
 ) -> None:
     """Fine-tune a local part-embedding model on a set's reference images.
 
@@ -327,6 +336,25 @@ def train_embedding(
 
     click.echo(f"Augmenting into {variants_per_part} variants per part ({augment_style} style)...")
     dataset = build_augmented_dataset(ref_images, variants_per_part=variants_per_part, seed=seed, style=augment_style)
+
+    if real_crops:
+        from .train.data import load_real_crops, merge_datasets
+
+        for manifest in real_crops:
+            real = load_real_crops(manifest)
+            n_crops = sum(len(v) for v in real.values())
+            click.echo(f"Real crops from {manifest}: {n_crops} corroborated crops across {len(real)} parts.")
+            dataset = merge_datasets(dataset, real)
+
+    if ldraw_dir:
+        from .train.data import merge_datasets
+        from .train.ldraw import render_training_images
+
+        click.echo("Rendering LDraw icon-style views...")
+        renders = render_training_images(inventory, ldraw_dir)
+        n_imgs = sum(len(v) for v in renders.values())
+        click.echo(f"LDraw renders: {n_imgs} views across {len(renders)}/{len(inventory)} inventory lines.")
+        dataset = merge_datasets(dataset, renders)
 
     def progress(epoch, total, loss, val_accuracy):
         if val_accuracy is None:

@@ -256,6 +256,32 @@ def test_capacity_reconcile_is_on_by_default():
     assert any(p.part_num == "B2" for p in result.parts)
 
 
+def test_overcount_by_step_reuse_is_reported_as_info_not_mismatch():
+    inv = [InventoryPart(part_num="3001", name="Brick 2 x 4", color_id=5, color_name="Red", quantity=1)]
+    # One real piece sighted in two build steps: total 2 vs piece count 1.
+    detections = [
+        PageDetection(page_index=0, bag_marker=1, callouts=[_callout(1, b"red")]),
+        PageDetection(page_index=1, callouts=[_callout(1, b"red")]),
+    ]
+    ident = FakeIdentifier(inv, {b"red": (0, 0.9)})
+    result = assemble_result(detections, inv, ident, num_pages=2, use_color=False)
+    red = next(p for p in result.parts if p.part_num == "3001")
+    assert red.count_matches is False  # data unchanged: numerically still a mismatch
+    assert any("multi-step reuse" in w for w in result.warnings)
+    assert not any("Count mismatch" in w for w in result.warnings)
+
+
+def test_large_overcount_is_still_a_mismatch_warning():
+    inv = [InventoryPart(part_num="3001", name="Brick 2 x 4", color_id=5, color_name="Red", quantity=1)]
+    # A single callout claiming 5 pieces vs inventory 1 is a real miscount,
+    # not explainable by the part recurring across steps.
+    detections = [PageDetection(page_index=0, bag_marker=1, callouts=[_callout(5, b"red")])]
+    ident = FakeIdentifier(inv, {b"red": (0, 0.9)})
+    result = assemble_result(detections, inv, ident, num_pages=1, use_color=False)
+    assert any("Count mismatch" in w for w in result.warnings)
+    assert not any("multi-step reuse" in w for w in result.warnings)
+
+
 def test_dump_crops_writes_files_and_manifest(tmp_path):
     import json
 

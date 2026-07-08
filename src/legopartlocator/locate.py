@@ -264,10 +264,20 @@ def assemble_result(
         if lp.reconciled and lp.inventory_qty is not None:
             lp.count_matches = lp.total_seen == lp.inventory_qty
             if not lp.count_matches:
-                warnings.append(
-                    f"Count mismatch for {lp.name or lp.key}: saw {lp.total_seen}, "
-                    f"inventory has {lp.inventory_qty}."
-                )
+                excess = lp.total_seen - lp.inventory_qty
+                if 0 < excess < len(lp.occurrences):
+                    # Over by less than the number of sightings: the same piece
+                    # is simply shown in several build steps — expected for a
+                    # location tool, so phrase it as information, not an error.
+                    warnings.append(
+                        f"{lp.name or lp.key} appears in {len(lp.occurrences)} step(s) "
+                        f"(piece count {lp.inventory_qty}) — multi-step reuse, not a miscount."
+                    )
+                else:
+                    warnings.append(
+                        f"Count mismatch for {lp.name or lp.key}: saw {lp.total_seen}, "
+                        f"inventory has {lp.inventory_qty}."
+                    )
 
     warnings.extend(identify_failure_msgs)
     if identify_failures > 3:

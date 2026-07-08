@@ -166,6 +166,69 @@ def build_augmented_dataset(
     return dataset
 
 
+def load_real_crops(
+    manifest_path,
+    min_confidence: float = 0.3,
+    require_brickognize: bool = True,
+) -> Dict[str, List[bytes]]:
+    """Load corroborated real callout crops from a ``scan --dump-crops`` manifest
+    as ``{part_num: [png bytes, ...]}`` — in-domain training labels.
+
+    Quality gates (why each exists):
+      * ``part_num == raw_part_num`` — a capacity-diverted crop's recorded
+        component scores describe the identifier's *raw* winner, not the final
+        label, so its corroboration can't vouch for the final label.
+      * ``require_brickognize`` — an independent model agreed; embedding-only
+        self-labels would just teach the model its own mistakes.
+      * ``min_confidence`` — trims the weakest tail. Calibrated on real 76307
+        data: corroborated blended confidences run ~0.28-0.67 (median 0.43,
+        dragged down by often-zero embedding components), so the default is a
+        low 0.3, not a "high-confidence" 0.5+.
+
+    Missing/unreadable crop files are skipped silently (the manifest outlives
+    its PNGs when a user cleans the dump directory).
+    """
+    import json
+    from pathlib import Path
+
+    manifest_path = Path(manifest_path)
+    base = manifest_path.parent
+    entries = json.loads(manifest_path.read_text(encoding="utf-8"))
+    out: Dict[str, List[bytes]] = {}
+    for e in entries:
+        part_num = e.get("part_num")
+        rel = e.get("file")
+        if not part_num or not rel:
+            continue
+        if e.get("raw_part_num") != part_num:
+            continue
+        if float(e.get("confidence", 0.0)) < min_confidence:
+            continue
+        if require_brickognize and float(e.get("components", {}).get("brickognize", 0.0)) <= 0.0:
+            continue
+        path = base / rel
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if data:
+            out.setdefault(part_num, []).append(data)
+    return out
+
+
+def merge_datasets(
+    base: Dict[str, List[bytes]], extra: Dict[str, List[bytes]]
+) -> Dict[str, List[bytes]]:
+    """Union of two ``{part_num: [crops]}`` datasets; lists concatenate (base
+    first). Non-mutating. Parts only in ``extra`` are included — even a
+    single-crop part is useful as a triplet negative."""
+    merged: Dict[str, List[bytes]] = {pn: list(crops) for pn, crops in base.items()}
+    for pn, crops in extra.items():
+        merged.setdefault(pn, [])
+        merged[pn] = merged[pn] + list(crops)
+    return merged
+
+
 def train_val_split(
     dataset: Dict[str, List[bytes]], val_frac: float = 0.25, seed: int = 0, min_train: int = 2
 ) -> "tuple[Dict[str, List[bytes]], Dict[str, List[bytes]]]":

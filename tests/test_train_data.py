@@ -4,7 +4,13 @@ import cv2
 import numpy as np
 import pytest
 
-from legopartlocator.train.data import augment, build_augmented_dataset, train_val_split
+from legopartlocator.train.data import (
+    augment,
+    build_augmented_dataset,
+    load_real_crops,
+    merge_datasets,
+    train_val_split,
+)
 
 
 def _count_near_black(png_bytes: bytes, thresh: int = 30) -> int:
@@ -153,3 +159,67 @@ def test_build_augmented_dataset_threads_style():
     photo = build_augmented_dataset(refs, variants_per_part=3, seed=0, style="photo")
     icon = build_augmented_dataset(refs, variants_per_part=3, seed=0, style="icon")
     assert photo["3001"] != icon["3001"]
+
+
+# --- real-crop loading (--real-crops): corroborated scan crops as in-domain labels ---
+
+def _entry(part, raw=None, conf=0.5, brick=0.7, file=None):
+    return {
+        "file": file,
+        "part_num": part,
+        "raw_part_num": raw if raw is not None else part,
+        "confidence": conf,
+        "components": {"brickognize": brick, "embedding": 0.4},
+    }
+
+
+def _write_manifest(tmp_path, entries):
+    import json
+
+    for e in entries:
+        if e["file"]:
+            p = tmp_path / e["file"]
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(f"crop:{e['file']}".encode())
+    (tmp_path / "manifest.json").write_text(json.dumps(entries), encoding="utf-8")
+    return tmp_path / "manifest.json"
+
+
+def test_load_real_crops_keeps_corroborated_undiverted(tmp_path):
+    manifest = _write_manifest(tmp_path, [
+        _entry("3001", file="3001/a.png"),
+        _entry("3001", file="3001/b.png"),
+        _entry("3020", file="3020/a.png"),
+    ])
+    crops = load_real_crops(manifest)
+    assert sorted(crops) == ["3001", "3020"]
+    assert len(crops["3001"]) == 2 and crops["3020"] == [b"crop:3020/a.png"]
+
+
+def test_load_real_crops_filters_bad_labels(tmp_path):
+    manifest = _write_manifest(tmp_path, [
+        _entry(None, file="unknown/a.png"),                       # unidentified
+        _entry("3001", raw="9999", file="3001/div.png"),          # capacity-diverted
+        _entry("3001", brick=0.0, file="3001/emb.png"),           # embedding-only
+        _entry("3001", conf=0.1, file="3001/weak.png"),           # below confidence floor
+        _entry("3001", file=None),                                # crop bytes never written
+        _entry("3001", file="3001/gone.png"),                     # file listed but deleted below
+        _entry("3001", file="3001/good.png"),
+    ])
+    (tmp_path / "3001" / "gone.png").unlink()
+    crops = load_real_crops(manifest)
+    assert crops == {"3001": [b"crop:3001/good.png"]}
+
+
+def test_load_real_crops_can_accept_embedding_only(tmp_path):
+    manifest = _write_manifest(tmp_path, [_entry("3001", brick=0.0, file="3001/emb.png")])
+    assert load_real_crops(manifest) == {}
+    assert load_real_crops(manifest, require_brickognize=False) == {"3001": [b"crop:3001/emb.png"]}
+
+
+def test_merge_datasets_concatenates_without_mutating():
+    base = {"3001": [b"aug1", b"aug2"]}
+    extra = {"3001": [b"real1"], "9999": [b"real2"]}
+    merged = merge_datasets(base, extra)
+    assert merged == {"3001": [b"aug1", b"aug2", b"real1"], "9999": [b"real2"]}
+    assert base == {"3001": [b"aug1", b"aug2"]}  # inputs untouched

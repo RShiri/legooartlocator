@@ -387,6 +387,87 @@ identifier correctly *declining* to place crops it can't corroborate. Not yet
 validated with embeddings on 76269 (the 5202-part gallery/training cost wasn't
 paid).
 
+### Follow-up round 2 — five phases probing what's next (dump-crops, floor, 76269, real-crops, LDraw)
+
+Ran the natural next round: instrument first, then let the data pick the next
+lever, rather than guessing. Order matters here — phase 1 produced the labelled
+data phases 2 and 4 needed.
+
+**Phase 1 — `scan --dump-crops DIR` (shipped).** Every callout crop was
+in-memory only; nothing could calibrate against real data or diagnose failures.
+Now writes `DIR/<part_num|unknown>/pNNN_iNNN.png` + `DIR/manifest.json` (page,
+bag, quantity, seen colour, final + raw part_num, confidence, per-signal
+component scores, top alternatives). First run on 76307 sharpened the picture:
+of the 10 unidentified parts, only **4 unique shapes** ever fail — all 4 are
+**identification misses, not detection misses** (they're cropped fine), and
+3 of 4 are transparent or printed parts (`3062b` trans-red, `4740`
+trans-light-blue, `3068bpr9329` printed tile) — exactly what a plain catalog
+photo represents worst.
+
+**Phase 2 — open-set embedding floor (closed, no code shipped).** Hypothesis:
+reject weak embedding-only matches outright. The manifest's real score
+distributions killed it before writing any filtering code — corroborated and
+embedding-only winners' embedding scores fully overlap (corroborated:
+0.00–0.66 across 49 crops; embedding-only: 0.24–0.53 across 23), so no
+threshold separates good from bad; any floor tight enough to matter would
+also cut real corroborated matches. A real negative result, cheaply reached
+because phase 1 existed.
+
+**Phase 3 — 76269 embedding validation (first-ever, strongly positive).**
+Trained `models/lego_embed_76269.pt` (407 parts, 4 variants/part, val 0.808)
+and ran booklet 1 (276 pages) both ways:
+
+| | identified | mismatches | mismatch rate |
+|---|---|---|---|
+| baseline (no embeddings) | 168 | 128 | 76% |
+| + embeddings | **251** | 157 | **62%** |
+
+**+83 parts (+49%) — and the mismatch rate per identified part improved**, not
+just its raw count. This is the clearest evidence yet that the whole approach
+(icon aug + semihard mining + capacity-reconcile) generalises well past the
+single 47-part set it was tuned on, onto a genuinely large, harder booklet.
+
+**Phase 4 — real-crop self-training via `--real-crops` (shipped as opt-in,
+measured negative — v4 stays default).** Built `train/data.py`
+`load_real_crops`/`merge_datasets`: feed corroborated `--dump-crops` output
+back in as in-domain labels. Retrained 76307
+(`--real-crops out/crops_76307/manifest.json` → v5): **35/47 identified, 6
+mismatches** vs. v4's **37/47, 7**. More precise (fewer, and less severe,
+mismatches) but *less* coverage — the real crops are few (49 across 31 parts,
+1-4 each) and skew training toward the shapes already working well rather than
+the ones that don't. v4 (`lego_embed_76307_v4.pt`) remains what ships.
+
+**Phase 5 — LDraw flat-shaded renderer (shipped as opt-in infra; prototype
+validated the mechanism, full measurement is mixed — not a shipped win yet).**
+Built `train/ldraw.py`: a from-scratch, numpy-only `.dat` parser (type 1
+subfile transforms resolved recursively through `parts/`/`p/`, type 2 edges,
+type 3/4 facets) + an orthographic rasterizer with quantized flat shading and
+depth-tested black edge strokes — genuinely icon-styled output, confirmed by
+eye against real crops before any training integration (the plan's go/no-go
+gate). `resolve_part_ref` falls back from a printed/decorated part number to
+its undecorated mould (e.g. `3068bpr9329` → `3068b`) since LDraw has no print
+geometry. Wired as `--ldraw-dir` on `train-embedding`, rendering 3
+instruction-plausible views per resolvable inventory part.
+
+Trained 76307 with it (v6) and measured for real: **36/47 identified, 7 hard
+mismatches + 3 reuse-info** vs. v4's **37/47, 7**. Genuinely mixed, not a clean
+win: it **did** recover `3068bpr9329` — the printed tile, one of the 4
+parts nothing before this could ever identify, confirming LDraw *can* close
+gaps catalog photos structurally can't — but it also **lost** 2 parts (`15672`,
+`79846`) that v4 had, for a net -1. Plausible cause, not yet confirmed: LDraw's
+flat single-colour fill has no print/texture detail, so for parts normally
+disambiguated by surface texture rather than silhouette, it may pull their
+embedding toward other similarly-shaped, similarly-flat-coloured parts. v4
+stays default; `--ldraw-dir` ships as a tested, opt-in path (7 new tests, no
+network needed for tests — only the ~80MB `complete.zip` from ldraw.org for
+actual use, gitignored, not committed). 164 tests pass overall.
+
+**Natural next step if this is picked back up:** apply LDraw renders only to
+the specific parts that are identification misses (a short, known list from
+phase 1's manifest) rather than the whole inventory, so it can't disturb
+embeddings for parts that already work. Not attempted this round — the
+current code renders for every resolvable inventory part.
+
 ### Follow-up — built-in quantity reader (the 'Nx' label): mismatches 11 → 7
 
 The remaining count-mismatch warnings were traced to real data: **every callout
