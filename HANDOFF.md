@@ -7,12 +7,18 @@ for how the tool itself works.
 ## Where things stand
 
 **Repo:** `RShiri/legooartlocator` — branch `claude/lego-pdf-part-scanner-lc3aiu`
-**Last commit:** `9bf6c51`
-**Tests:** 119 passing + 3 skipped without the `[train]` extra, all offline (`pytest`)
+**Last commit:** `31c9b41`
+**Tests:** 127 passing, all offline (`pytest`) — torch **is** installed now (`[train]`
+extra), so the 3 previously-skipped `TrainedBackend` contract tests run for real.
 **User's environment:** Windows, Python venv at `.venv`, `run.bat` wrapper
 (`run scan ...` / `run debug ...`), no Tesseract binary installed. AMD Radeon
-RX 6800 GPU (no CUDA — DirectML is the acceleration path), Ryzen 5 5600X
-(6-core), 16GB RAM. **User does not want the Claude engine/API used** — work
+RX 6800 GPU — confirmed **no CUDA, and no DirectML either**: `torch-directml`
+only ships wheels for Python 3.8-3.12, this venv is **Python 3.14**, so
+training actually runs on **CPU** (still tractable for this dataset size: ~4-8
+min for 27-40 epochs on 41 parts). Ryzen 5 5600X (6-core), 16GB RAM.
+`REBRICKABLE_API_KEY` is set in `.env` (gitignored, not committed — a fresh
+session needs the user to re-provide it if `.env` is missing). **User does
+not want the Claude engine/API used** — work
 so far this session has been entirely on the free local engine.
 No `torch` installed yet (needed for `[ml]`/`[train]` extras).
 
@@ -251,103 +257,152 @@ Asked what "train the model" meant specifically (ambiguous: enable the
 existing zero-shot CLIP embeddings? train a real custom classifier? something
 else?) — user picked **train a real custom part-classifier**. Went through
 `EnterPlanMode` given the scope (new deps, new training pipeline, hardware
-constraints to work around); plan approved, then implemented and committed as
-`9bf6c51`:
+constraints to work around); plan approved, then implemented (`9bf6c51`),
+**actually run for real** with the user's Rebrickable key (`31c9b41` adds
+validation), and iterated on real results. This is a complete arc, not a
+"built but never run" placeholder — worth reading in full before assuming
+where things stand.
 
-- **New `lpl train-embedding` command** — fine-tunes a small pretrained CNN
-  (MobileNetV3-Small or ResNet18, via `torchvision`) into a LEGO-part
-  embedding model with **triplet-loss metric learning**, using one reference
-  photo per part (from an inventory file or `--set` + `REBRICKABLE_API_KEY`)
-  expanded into several augmented variants each (rotation, colour jitter,
-  blur/downsample, a flatten/posterize pass, background padding — an attempt
-  to narrow the gap between glossy catalog photos and the flatter
-  instruction-icon crops actually scanned, not a guaranteed fix for it).
-  Saves a checkpoint usable via `lpl scan --engine local --embeddings
-  --embedding-weights PATH` — a **drop-in replacement for the existing
-  pretrained-CLIP path** (`embedding.TrainedBackend` implements the exact
-  same `embed_images()` interface as the existing `ClipBackend`; `Gallery`,
-  `build_gallery`, `identify.py`'s ensemble all needed zero changes).
-- **New `[train]` extra**: `torch`, `torchvision`, and `torch-directml` on
-  Windows specifically — confirmed via a real PyPI lookup that
-  `torch-directml` exists and is the right acceleration path for this
-  machine's AMD GPU (no CUDA, ROCm doesn't support Windows well). Nothing
-  installed yet — this extra has never actually been `pip install`ed in this
-  environment, so the real torch-dependent code path (`train/embedding_trainer.py`,
-  `embedding.TrainedBackend`) has **only been exercised via `# pragma: no
-  cover` code review, never actually run**. Same untested-until-installed
-  status `ClipBackend` has always had in this project, just now true for our
-  own trainer too.
-- **Design note**: the triplet-*sampling* logic (which crops pair up as
-  anchor/positive/negative) was deliberately split into its own pure-Python
-  module (`train/sampling.py`, no torch) specifically so it could be
-  unit-tested in this environment where torch isn't installed — 16 new
-  tests, 3 of which (`TrainedBackend` contract tests) are marked
-  `pytest.importorskip("torch")` and currently skip, ready to actually run
-  once torch is installed.
-- **Not yet done**: no real training run has happened. Blocked on getting a
-  `REBRICKABLE_API_KEY` from the user (asked during planning, they agreed to
-  get one) — needed for reliable per-part image URLs at scale; a quick
-  BrickLink-URL-guessing test using `colors.py`'s colour IDs already failed
-  (BrickLink and Rebrickable use different internal colour numbering).
+**What got built:**
+- **`lpl train-embedding`** — fine-tunes MobileNetV3-Small/ResNet18 with
+  **triplet-loss metric learning** on one reference photo per part (from
+  `--set`+`REBRICKABLE_API_KEY` or an inventory file), each expanded into
+  several augmented variants (rotation, colour jitter, blur/downsample, a
+  flatten/posterize pass, background padding). Saves a checkpoint used via
+  `lpl scan --engine local --embeddings --embedding-weights PATH` — a
+  **drop-in replacement** for the existing pretrained-CLIP path
+  (`embedding.TrainedBackend` implements the same `embed_images()` interface
+  as `ClipBackend`; `Gallery`/`build_gallery`/`identify.py`'s ensemble needed
+  zero changes).
+- **Validation + early stopping** (added after the first real run exposed a
+  real problem — see below): `train.data.train_val_split` holds out a
+  fraction of each part's *variants* (not whole parts — what matters for a
+  retrieval model is recognising a different view of an already-seen part);
+  `evaluate_retrieval_accuracy` measures top-1 retrieval accuracy on the
+  held-out set each epoch; training stops after `--patience` epochs with no
+  improvement and saves the *best* epoch's checkpoint, not the last one.
+- The triplet-*sampling* logic (`train/sampling.py`, pure Python) is
+  unit-tested without torch; the actual torch training loop
+  (`train/embedding_trainer.py`) and `embedding.TrainedBackend` are lazily
+  imported and marked `# pragma: no cover`, same convention `ClipBackend` has
+  always had.
+
+**What actually happened when it ran for real** (this is the important
+part — a first-principles ML result, not a code-review guess):
+
+1. **Environment reality check**: `torch-directml` (planned as the AMD-GPU
+   acceleration path) turned out to have **no wheel for Python 3.14** (this
+   venv's version — only ships for 3.8-3.12, confirmed against PyPI). Fixed
+   the `pyproject.toml` marker so `pip install -e ".[train]"` doesn't hard-fail
+   on newer Python, just silently falls back to CPU. Training on CPU is
+   still tractable for this dataset size (4-8 min for 27-40 epochs on 41
+   parts) — not blocking, just slower than hoped.
+2. **First real run** (5 epochs, no validation): trained fine, loss dropped
+   0.149 → 0.044. Real scan comparison (76307, same inventory,
+   brickognize+colour baseline vs. +trained embeddings) showed **35/47
+   identified vs. baseline's 31/47, zero regressions** — but also **23 count-
+   mismatch warnings vs. baseline's 12**, several severe (one part matched 15
+   different real crops against an inventory quantity of 1). Classic
+   undertrained-embedding "attractor" symptom.
+3. **Tried the obvious fixes, neither worked cleanly**: more epochs (40,
+   no validation) pushed identified count up further (37/47) without losing
+   anything, but the overcounting didn't go away — it shifted which part was
+   worst-affected. Lowering the embedding's ensemble blend weight (0.4 →
+   0.15) made things *worse* (34/47, one mismatch ballooned to 21 vs. 6).
+   Neither is a real fix because there was no way to tell whether more
+   training was actually helping vs. just changing which mistakes got made.
+4. **Added real validation** (see above) and reran: retrieval accuracy on
+   held-out augmented variants climbed to **96.7%** (early-stopped at epoch
+   27, correctly kept epoch 19's checkpoint — proof the early-stopping logic
+   works, not just that loss went down). But on the **real scan**, this
+   checkpoint performed essentially the same as the un-validated 40-epoch
+   version (36/47 identified, 22 mismatches, worst overcount still 10 vs. 1).
+5. **The actual conclusion**: 96.7% validation accuracy but no improvement on
+   real crops conclusively shows this **is a domain-gap problem, not an
+   undertraining problem** — the model generalises well *within* the
+   augmented-catalog-photo distribution (that's what validation measures) but
+   that skill doesn't transfer to the real instruction-booklet icon crops it
+   sees at inference, because validation is drawn from the same distribution
+   as training and can't see the gap. More epochs, more patience, or
+   ensemble-weight tuning on *this* dataset won't fix it — confirmed, not
+   assumed.
+6. **Net result, stated plainly**: the trained embeddings are a **real, if
+   modest, net improvement** over the Brickognize/colour-only baseline (31→36
+   identified, zero regressions across every experiment run) but come with a
+   **real, unresolved cost** (roughly 2x the count-mismatch warnings, some
+   severe). Whether that trade is worth shipping depends on whether coverage
+   or count-accuracy matters more for a given use case — this file states
+   the trade-off rather than picking a winner. The kept checkpoint is
+   `models/lego_embed_76307_v3.pt` (gitignored, not committed — regenerate
+   with the command in "Immediate next step").
+7. **What would actually move this forward**: real instruction-booklet-style
+   training images (not catalog photos + augmentation) — either hand-labelled
+   real crops (need enough real scans first) or synthetic rendering from a
+   closer-matching source (LDraw 3D models, flagged as a stretch goal in the
+   original plan and never attempted — a much bigger undertaking: needs a
+   renderer, not just more `pip install`s).
 
 ## Immediate next step
 
-1. **Get the `REBRICKABLE_API_KEY` from the user** (they agreed to sign up
-   during planning) and `pip install -e ".[train]"`, then run a real
-   end-to-end training pass for the first time ever:
-   ```
-   run train-embedding --inventory-file samples/76307_inventory.csv --out models/lego_embed.pt --epochs 5
-   run scan 6559641.pdf --engine local --embeddings --embedding-weights models/lego_embed.pt --inventory-file samples/76307_inventory.csv --out out
-   ```
-   Compare identification results/confidence against the existing
-   pretrained-CLIP baseline (or against the Brickognize-only baseline from
-   earlier this session, 31/42 parts matched) to see whether the trained
-   model actually helps. This is the first time any of the new training code
-   will have actually executed — expect to find and fix real bugs, the same
-   way every other piece of this project needed real-data debugging before
-   it worked (see every other section of this file).
-2. Once training works on 76307's small 42-part catalog, consider expanding
-   to 76269's much larger catalog (needs the same `REBRICKABLE_API_KEY` to
-   fetch its inventory in the first place — see below).
-3. **12 residual bag-marker false positives on 76269** (~2% of 644 pages) —
+1. **Training's real conclusion needs a decision, not more blind iteration**
+   (see "Then: user said ... train the model" above for the full evidence):
+   trained embeddings are a net improvement on identified-part coverage
+   (31→36/47, zero regressions) but roughly double the count-mismatch
+   warnings, confirmed to be a domain-gap issue (validated to 96.7% on
+   held-out augmented data, no corresponding improvement on real crops) —
+   not something more epochs fixes. Options, roughly in effort order:
+   - Ship as-is / make it opt-in (`--embeddings --embedding-weights` is
+     already off by default) and let the user decide per-scan whether
+     coverage or count-accuracy matters more.
+   - Try `--val-frac`/`--patience`/`--variants-per-part` tuning for
+     marginal gains (cheap, but the domain-gap ceiling won't move much).
+   - Pursue real domain-matching training data — LDraw synthetic rendering
+     (flagged as a stretch goal from the start, never attempted; needs a
+     3D renderer, real engineering effort) or hand-labelled real crops
+     from actual scans (needs a labelled dataset that doesn't exist yet).
+   - Investigate whether raising `identify.py`'s `DEFAULT_WEIGHTS` isn't
+     the right lever at all, and instead the *count-reconciliation* step
+     (`reconcile.py`/`aggregate.py`) should treat embedding-only matches
+     (no brickognize agreement) with lower trust — not attempted this
+     session, a plausible different angle on the same symptom.
+2. **12 residual bag-marker false positives on 76269** (~2% of 644 pages) —
    not yet individually diagnosed the way 76307's were; same general
    "illustration element happens to look digit-shaped" class.
-4. **Get a real inventory for 76269 to actually run `lpl scan`** — needs the
-   same `REBRICKABLE_API_KEY` (5202 parts is too many to browser-scrape).
-   Then: `run scan 6488032.pdf --engine local --set 76269 --out out`.
-5. If pushing 76307's identification further is wanted independent of
-   training: 11/42 parts still unidentified via Brickognize/colour alone,
-   quantities undercounted — `samples/76307_inventory.csv` plus a fresh run
-   of:
-   ```
-   run scan 6559641.pdf --engine local --inventory-file samples/76307_inventory.csv --out out
-   ```
-   are the starting point (result isn't committed — regenerate).
-6. Load `out/result.json` into `web/index.html` (drag-drop) and sanity-check
+3. **Get a real inventory for 76269 to actually run `lpl scan`** — the
+   `REBRICKABLE_API_KEY` is now in `.env` and confirmed working; just needs
+   running: `run scan 6488032.pdf --engine local --set 76269 --out out`.
+   Also enables training a bigger-catalog embedding model
+   (`run train-embedding --set 76269 --out models/lego_embed_76269.pt`) if
+   more training data turns out to matter more than domain-matching data —
+   worth trying given how cheap it now is with a working key, even though
+   the domain-gap analysis above suggests it may not be the main lever.
+4. If pushing 76307's identification further independent of training:
+   `run scan 6559641.pdf --engine local --set 76307 --out out` (no
+   embeddings) reproduces the 31/47 baseline; `out/scan_baseline`,
+   `out/scan_trained_v3` etc. from this session are local-only (gitignored,
+   not committed) — regenerate as needed.
+5. Load `out/result.json` into `web/index.html` (drag-drop) and sanity-check
    a few parts against the physical instructions, for whichever set has a
    fresh scan result.
 
 ## Known open items (not yet started, roughly ranked)
 
-- **No real training run has happened yet.** `lpl train-embedding` and
-  `embedding.TrainedBackend` are implemented and unit-tested at the
-  interface/logic level, but the actual torch training loop has never
-  executed — blocked on `REBRICKABLE_API_KEY` + `pip install -e ".[train]"`.
-  See "Then: user said ... train the model" above.
+- **Trained embeddings' domain-gap problem is diagnosed, not fixed.** Real
+  net improvement on identified-part coverage, roughly 2x the count-mismatch
+  warnings, confirmed via validation (96.7% held-out accuracy, no
+  corresponding real-scan improvement) to be a domain-gap issue rather than
+  undertraining. See "Then: user said ... train the model" above for the
+  full evidence and "Immediate next step" for options.
 - **12/644 pages on 76269 still have bag-marker false positives (~2%).** Not
   yet individually diagnosed — see "Then: tested a real bigger multi-booklet
   set" above.
-- **76269 has no inventory and no `lpl scan` has been run on it.** 5202 parts
-  is too many for the browser-scraping approach used for 76307 — needs a real
-  `REBRICKABLE_API_KEY` (user has to sign up themselves; not something this
-  agent should do). See "Immediate next step" above.
-- **11/42 parts on 76307 still unidentified, quantities undercounted.** The
-  border-based panel detector is real progress (9→43 parts found, 31 matched
-  to a real part_num) but not full coverage — see "Then: got a real inventory
-  ..." above for what's confirmed vs. still missing.
-- **`--embeddings` (local CLIP image matching) never exercised** on a real
-  set — needs the `[ml]` extra (`pip install -e ".[ml]"`, pulls in torch).
-  Might help close some of the remaining 11 unidentified parts.
+- **76269 has no inventory and no `lpl scan` has been run on it.** The
+  `REBRICKABLE_API_KEY` now works (confirmed, see below) — this is now just
+  "hasn't been run yet," not blocked. See "Immediate next step" above.
+- **11/47 parts on 76307 still unidentified via Brickognize/colour alone**
+  (36/47 with trained embeddings, see above). The border-based panel
+  detector from earlier this session is real progress (9→43 parts found
+  pre-training) but not full coverage.
 - **Tesseract not installed** on the user's machine — quantities currently
   default to 1 on the local engine (bag numbers work fine without it, via
   ordinal assignment). Installing Tesseract would unlock real quantity/part-ID
@@ -358,17 +413,16 @@ constraints to work around); plan approved, then implemented and committed as
   as "cells", tripping `is_parts_list`) are currently harmless — such pages
   are already excluded from parts attribution.
 - **rebrickable.com and lego.com return HTTP 403 to `curl`/WebFetch from this
-  sandbox** (Cloudflare bot-challenge) — confirmed it's bot detection, not a
-  network block (`curl https://www.google.com` works). The claude-in-chrome
-  MCP (a real browser session) gets through fine; that's how
-  `samples/76307_inventory.csv` was obtained with no API key. Note this only
-  scales to small sets (~50 parts) — 76269's 5202 parts is too many rows to
-  scrape this way; a real API key is the right tool past that size.
-  Separately, `lpl scan --set NNNN`'s *own* built-in auto-fetch (`fetcher.py`,
-  hits lego.com to find the PDF download link, not Rebrickable) worked fine
-  from this same sandbox for 76269 — so the 403 issue is specific to
-  Rebrickable's/lego.com's *webpage* bot-challenge, not their PDF/API
-  endpoints generally.
+  sandbox** (Cloudflare bot-challenge) for their *webpages* — confirmed it's
+  bot detection, not a network block (`curl https://www.google.com` works).
+  The **Rebrickable API itself is unaffected** (confirmed working directly
+  via `RebrickableClient` with the user's key — no browser workaround
+  needed for API calls, only for scraping the website by hand like
+  `samples/76307_inventory.csv` was before the key existed). Separately,
+  `lpl scan --set NNNN`'s own built-in auto-fetch (`fetcher.py`, hits
+  lego.com to find the PDF download link) also worked fine from this same
+  sandbox — so the 403 issue has only ever been the webpage bot-challenge,
+  never the PDF/API endpoints.
 - **No PR opened** for this branch — user hasn't asked for one yet.
 
 ## Full session history (condensed)
@@ -453,35 +507,36 @@ tool works.
 Short version: it's a LEGO instruction-PDF scanner that maps parts to
 bag/page. Two engines: a paid Claude-vision engine (user does NOT want this
 used) and a free local OpenCV+Brickognize+embeddings engine
-(`lpl scan --engine local`). 119 tests pass + 3 skip without the `[train]`
-extra, all committed (`9bf6c51`).
+(`lpl scan --engine local`). 127 tests pass, all committed (`31c9b41`). Torch
+is installed (`.venv` has the `[train]` extra); `REBRICKABLE_API_KEY` is in
+`.env` (gitignored -- ask the user again if it's missing in a fresh checkout).
 
 Two real sets tested so far. **76307** (Iron Man Mech, 56 pages, single
 unnumbered bag): full detection calibration done (zero bag-marker false
-positives), first-ever identify-pipeline run got 43/42 parts located (31
-correctly matched by part number) using samples/76307_inventory.csv (a real
-Rebrickable export, no API key needed for a set this small). **76269**
-(Avengers Tower, 3 booklets / 644 pages / 5202 parts -- the "bigger PDF"
-test): confirmed the classic white-panel style works natively, found and
-fixed a new bag-marker style (circled digits, e.g. "②"/"③"/"⑦" -- one per
-booklet, real structure never seen before), verified all 3 real covers now
-detected correctly. 76269 has ~2% residual bag-marker false positives (not
-yet diagnosed) and no inventory yet (needs a free REBRICKABLE_API_KEY --
-5202 parts is too many to scrape via browser).
+positives). **76269** (Avengers Tower, 3 booklets / 644 pages / 5202 parts --
+the "bigger PDF" test): confirmed the classic white-panel style works
+natively, found and fixed a new bag-marker style (circled digits, e.g.
+"②"/"③"/"⑦" -- one per booklet), verified all 3 real covers detected
+correctly. Has ~2% residual bag-marker false positives (not yet diagnosed)
+and no inventory/scan run yet (no longer blocked -- the API key works now,
+just hasn't been done).
 
-Then the user said they don't want Claude/Claude-API used, and asked to
-"train the model" -- clarified they meant a real custom part-classifier, not
-just enabling the existing zero-shot CLIP embeddings. Built `lpl
-train-embedding`: fine-tunes a small CNN with triplet-loss metric learning on
-a set's own (augmented) reference images, saved as a checkpoint usable via
-`--embeddings --embedding-weights PATH` -- a drop-in replacement for
-pretrained CLIP, no code changes needed elsewhere. Implemented and unit
-tested at the logic/interface level, but **no real training run has
-happened yet** -- blocked on the user getting a REBRICKABLE_API_KEY (they
-agreed to) and installing the new `[train]` extra (torch + torchvision +
-torch-directml, since this machine has an AMD GPU, no CUDA).
+Then the user said no Claude/Claude-API, and asked to "train the model" --
+clarified they meant a real custom part-classifier. Built `lpl
+train-embedding` (triplet-loss metric learning on a set's augmented reference
+images, drop-in replacement for pretrained CLIP via `--embedding-weights`)
+and **actually ran it for real** multiple times against 76307. Real, honest
+result: net improvement on identified-part coverage (31->36/47, zero
+regressions across every experiment) but ~2x the count-mismatch warnings.
+Added validation-based early stopping (96.7% held-out retrieval accuracy) to
+rule out "just needs more training" -- confirmed this is a domain-gap issue
+(catalog photos vs. real instruction-icon crops), not undertraining. Full
+evidence and options are in HANDOFF.md's "Then: user said ... train the
+model" section -- don't re-litigate this without reading it first, the
+experimentation is already done and conclusive on the "more epochs" question.
 
-Next: see "Immediate next step" in HANDOFF.md -- top priority is getting the
-REBRICKABLE_API_KEY and running the first-ever real training pass (expect to
-find and fix real bugs, same as everything else in this project).
+Next: see "Immediate next step" in HANDOFF.md -- top item is deciding what to
+do with the training result (ship as-is, tune further for marginal gains, or
+pursue real domain-matching training data), not re-running the same
+experiment.
 ```
