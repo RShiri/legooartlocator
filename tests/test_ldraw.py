@@ -95,3 +95,31 @@ def test_render_training_images_builds_dataset(lib, tmp_path):
     assert len(out["9999"]) == 2            # one image per view
     for blob in out["9999"]:
         assert blob[:8] == b"\x89PNG\r\n\x1a\n"  # real encoded PNGs
+
+
+def test_render_training_images_only_parts_restricts_rendering(lib, tmp_path):
+    """A second resolvable part ('8888', reusing the same primitive under a new
+    number) so the filter has something real to exclude."""
+    (tmp_path / "parts" / "8888.dat").write_text(
+        "0 second test part\n"
+        "1 16 0 0 0  10 0 0  0 10 0  0 0 10 box1.dat\n",
+        encoding="utf-8",
+    )
+    lib2 = LDrawLibrary(tmp_path)
+    from legopartlocator.models import InventoryPart
+    from legopartlocator.train.ldraw import render_training_images
+
+    parts = [
+        InventoryPart(part_num="9999", name="A", quantity=1, color_name="Red"),
+        InventoryPart(part_num="8888", name="B", quantity=1, color_name="Blue"),
+    ]
+    views = ((35.0, -25.0),)
+
+    everyone = render_training_images(parts, lib2.root, views=views, size=64)
+    assert sorted(everyone) == ["8888", "9999"]  # default: whole inventory
+
+    only_one = render_training_images(parts, lib2.root, views=views, size=64, only_parts={"9999"})
+    assert sorted(only_one) == ["9999"]  # '8888' is resolvable but excluded
+
+    none_selected = render_training_images(parts, lib2.root, views=views, size=64, only_parts={"no-such-part"})
+    assert none_selected == {}

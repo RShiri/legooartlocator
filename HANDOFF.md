@@ -462,11 +462,42 @@ stays default; `--ldraw-dir` ships as a tested, opt-in path (7 new tests, no
 network needed for tests — only the ~80MB `complete.zip` from ldraw.org for
 actual use, gitignored, not committed). 164 tests pass overall.
 
-**Natural next step if this is picked back up:** apply LDraw renders only to
-the specific parts that are identification misses (a short, known list from
-phase 1's manifest) rather than the whole inventory, so it can't disturb
-embeddings for parts that already work. Not attempted this round — the
-current code renders for every resolvable inventory part.
+**Phase 6 — targeted LDraw, testing exactly that next step (tried, refuted).**
+Added `render_training_images(..., only_parts={...})` + `train-embedding
+--ldraw-only PART,PART,...` so LDraw renders can be restricted to specific
+parts instead of the whole inventory — directly testing whether that avoids
+the regressions whole-inventory LDraw (v6) caused. Trained v7 with
+`--ldraw-only 25269,3062b,3068bpr9329,4740` (the 4 known identification-miss
+parts, from phase 1's manifest) and measured for real:
+
+| | identified | mismatches |
+|---|---|---|
+| v4 (icon aug only) | 37 | 7 |
+| v6 (LDraw, whole inventory) | 36 | 7 hard + 3 reuse-info |
+| v7 (LDraw, targeted to 4 parts) | 36 | 8 hard + 3 reuse-info |
+
+**The hypothesis did not hold — this is a clean negative, not a partial win.**
+None of the 4 targeted parts were actually recovered by v7. Worse, a
+previously-safe, completely untouched part (`61332`) regressed anyway, even
+though its training photos never changed. The reason: semi-hard mining
+re-embeds and mines negatives from the *entire* gallery every epoch, so
+changing even 4 parts' training images reshapes the whole embedding space's
+gradient signal through shared negatives — "targeting" doesn't actually
+isolate anything once semi-hard mining is in the loop. v7 did recover 2 of
+v6's regressions (`15672`, `79846`) but lost the one part v6 had gained
+(`3068bpr9329`) plus the new `61332` loss, netting the same coverage as v6
+(36) with a worse mismatch count (11 vs 10). `--ldraw-only` ships as tested,
+working infrastructure (8 new tests) — the mechanism is sound and may pair
+usefully with non-semihard mining or a from-scratch (not fine-tuned) run
+later — but it is not the fix. v4 remains the shipped checkpoint. 165 tests
+pass overall.
+
+This closes out the LDraw investigation for now: two honest attempts (whole-
+inventory, targeted), both measured, neither a net win on 76307. Further
+micro-tuning here has diminishing returns without new signal — the next real
+lever, if this is picked up again, is more/better real crops (phase 4 found
+only 49 across 31 parts) or a genuinely different training objective, not
+another LDraw variant.
 
 ### Follow-up — built-in quantity reader (the 'Nx' label): mismatches 11 → 7
 

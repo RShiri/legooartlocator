@@ -233,15 +233,28 @@ def render_training_images(
     lib_root: str | Path,
     views: Sequence[Tuple[float, float]] = DEFAULT_VIEWS,
     size: int = 224,
+    only_parts: Optional[set] = None,
 ) -> Dict[str, List[bytes]]:
-    """Render icon-style PNG training images for every inventory part with an
-    LDraw model: ``{part_num: [png bytes per view]}``.
+    """Render icon-style PNG training images for inventory parts with an LDraw
+    model: ``{part_num: [png bytes per view]}``.
 
     ``parts`` is a sequence of ``InventoryPart``-shaped objects (``part_num``,
     ``color_name``). Fill colour comes from the part's colour name via
     ``colors.name_to_rgb`` (mid-gray fallback). Parts with no resolvable .dat
     are simply omitted — the caller merges these renders with catalog-photo
     variants, so such parts keep their photo-only training data.
+
+    ``only_parts``, when given, restricts rendering to that set of part
+    numbers — every other part is skipped entirely, keeping its existing
+    catalog-photo training data completely untouched. Whole-inventory LDraw
+    (the default, ``only_parts=None``) measurably fixed one identification-miss
+    part on 76307 but also *regressed* two parts that catalog photos already
+    handled correctly — the working theory is that LDraw's flat, textureless
+    fill can pull a plain-coloured part's embedding toward other
+    similarly-shaped, similarly-flat-coloured parts it wasn't confused with
+    before. Targeting only the parts that actually need it (from a
+    ``scan --dump-crops`` manifest's unidentified list) is the way to get
+    LDraw's proven benefit without that side effect.
     """
     import cv2  # local: keep module importable without OpenCV for the pure paths
 
@@ -252,6 +265,8 @@ def render_training_images(
     for part in parts:
         part_num = part.part_num
         if not part_num or part_num in out:
+            continue
+        if only_parts is not None and part_num not in only_parts:
             continue
         ref = resolve_part_ref(library, part_num)
         if ref is None:

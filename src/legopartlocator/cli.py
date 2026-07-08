@@ -282,6 +282,10 @@ def debug(pdf: str, out_dir: str, page_spec: Optional[str], dpi: int,
               help="LDraw library root (the folder holding parts/ and p/, from ldraw.org complete.zip). "
                    "Adds flat-shaded icon-style renders of each part as training images — the closest "
                    "match to how instruction booklets actually draw parts.")
+@click.option("--ldraw-only", "ldraw_only", default=None,
+              help="Comma-separated part numbers to restrict --ldraw-dir rendering to (e.g. the "
+                   "unidentified parts from a prior scan). Every other part's training data is left "
+                   "completely untouched. Omit to render for the whole inventory.")
 @click.option("--batch-size", type=int, default=16, show_default=True)
 @click.option("--val-frac", type=float, default=0.25, show_default=True,
               help="Fraction of each part's variants held out to measure retrieval accuracy each epoch.")
@@ -292,7 +296,7 @@ def train_embedding(
     inventory_file: Optional[str], set_num: Optional[str], out_path: str, backbone: str,
     embedding_dim: int, epochs: int, variants_per_part: int, augment_style: str,
     triplets_per_epoch: int, mining: str, real_crops: tuple, ldraw_dir: Optional[str],
-    batch_size: int, val_frac: float, patience: int, seed: int,
+    ldraw_only: Optional[str], batch_size: int, val_frac: float, patience: int, seed: int,
 ) -> None:
     """Fine-tune a local part-embedding model on a set's reference images.
 
@@ -350,8 +354,13 @@ def train_embedding(
         from .train.data import merge_datasets
         from .train.ldraw import render_training_images
 
-        click.echo("Rendering LDraw icon-style views...")
-        renders = render_training_images(inventory, ldraw_dir)
+        only_parts = None
+        if ldraw_only:
+            only_parts = {p.strip() for p in ldraw_only.split(",") if p.strip()}
+            click.echo(f"Rendering LDraw icon-style views (restricted to {len(only_parts)} part(s))...")
+        else:
+            click.echo("Rendering LDraw icon-style views...")
+        renders = render_training_images(inventory, ldraw_dir, only_parts=only_parts)
         n_imgs = sum(len(v) for v in renders.values())
         click.echo(f"LDraw renders: {n_imgs} views across {len(renders)}/{len(inventory)} inventory lines.")
         dataset = merge_datasets(dataset, renders)
