@@ -592,3 +592,8 @@ short current-state file plus this history archive.
 13. **Full codebase hardening pass**: audited and fixed real bugs across
     modules untouched until then, added missing test coverage, added lint,
     cleaned up documentation and packaging.
+14. **Pushed to `main`**: `main` had never received this project (a single
+    placeholder-README commit since the repo's creation). Verified `main`
+    was a strict ancestor of the feature branch (a clean fast-forward, no
+    merge commit, nothing lost or overwritten) and fast-forwarded it to
+    match — a fresh clone of `main` now gets the real project, not a stub.

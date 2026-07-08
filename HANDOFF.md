@@ -8,7 +8,10 @@ itself works and its module layout.
 
 ## Repo & environment
 
-**Repo:** `RShiri/legooartlocator` — branch `claude/lego-pdf-part-scanner-lc3aiu`.
+**Repo:** `RShiri/legooartlocator`. Work happened on branch
+`claude/lego-pdf-part-scanner-lc3aiu`; `main` was fast-forwarded to match it
+(no PR needed — `main` had nothing but a placeholder README, so the merge was
+a clean fast-forward with zero divergence). Both point at the same commit.
 **Tests:** run `pytest` (don't hard-code the count here — it drifts every
 round). `ruff check .` for lint. CI (`.github/workflows/ci.yml`) runs the main
 matrix (Ubuntu 3.11/3.12 + Windows 3.12, plus lint) and a separate job that
@@ -121,17 +124,22 @@ stable system.
    bigger `--dump-crops` manifests than the 49-crop one tried) or a genuinely
    different training objective — not another LDraw variant (two honest
    attempts there didn't pan out).
-4. **No PR opened yet** for this branch — not requested.
+4. **More real PDFs would help directly** — the real-crop self-training
+   attempt above was data-starved (49 crops across 31 parts from one set).
+   If the user provides more instruction PDFs (dropped in the repo root, or
+   just a set number to auto-fetch via `--set NNNN`), rerunning `--dump-crops`
+   across more sets is the most direct way to grow that corpus.
 
 ## Resume prompt
 
 Paste this into a fresh session to continue:
 
 ```
-I'm continuing work on legooartlocator (github.com/RShiri/legooartlocator,
-branch claude/lego-pdf-part-scanner-lc3aiu). Read HANDOFF.md at the repo root
-first for current state, then HANDOFF_HISTORY.md if you need the full
-chronological story, then README.md for how the tool works.
+I'm continuing work on legooartlocator (github.com/RShiri/legooartlocator --
+main and claude/lego-pdf-part-scanner-lc3aiu point at the same commit). Read
+HANDOFF.md at the repo root first for current state, then HANDOFF_HISTORY.md
+if you need the full chronological story, then README.md for how the tool
+works.
 
 It's a LEGO instruction-PDF scanner mapping parts to bag/page. Local engine
 only (`--engine local`) -- no paid Claude API. Shipped defaults: icon-style
