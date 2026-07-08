@@ -7,11 +7,14 @@ for how the tool itself works.
 ## Where things stand
 
 **Repo:** `RShiri/legooartlocator` — branch `claude/lego-pdf-part-scanner-lc3aiu`
-**Last commit:** `c9a8a0c`
-**Tests:** 103 passing, all offline (`pytest`)
+**Last commit:** `9bf6c51`
+**Tests:** 119 passing + 3 skipped without the `[train]` extra, all offline (`pytest`)
 **User's environment:** Windows, Python venv at `.venv`, `run.bat` wrapper
-(`run scan ...` / `run debug ...`), no Tesseract binary installed, no paid
-API keys purchased yet.
+(`run scan ...` / `run debug ...`), no Tesseract binary installed. AMD Radeon
+RX 6800 GPU (no CUDA — DirectML is the acceleration path), Ryzen 5 5600X
+(6-core), 16GB RAM. **User does not want the Claude engine/API used** — work
+so far this session has been entirely on the free local engine.
+No `torch` installed yet (needed for `[ml]`/`[train]` extras).
 
 The tool scans a LEGO instruction-PDF and maps every part to the numbered bag
 and pages it appears on (that mapping exists nowhere else — not in any API,
@@ -242,35 +245,95 @@ Rebrickable — far beyond the browser-scraping approach used for 76307; see
    was attempted on 76269 as a result — this session's 76269 work was
    detection-layer only (bag markers + panel style), not identification.
 
+## Then: user said "i dont want to use claude and claude api key. train the model."
+
+Asked what "train the model" meant specifically (ambiguous: enable the
+existing zero-shot CLIP embeddings? train a real custom classifier? something
+else?) — user picked **train a real custom part-classifier**. Went through
+`EnterPlanMode` given the scope (new deps, new training pipeline, hardware
+constraints to work around); plan approved, then implemented and committed as
+`9bf6c51`:
+
+- **New `lpl train-embedding` command** — fine-tunes a small pretrained CNN
+  (MobileNetV3-Small or ResNet18, via `torchvision`) into a LEGO-part
+  embedding model with **triplet-loss metric learning**, using one reference
+  photo per part (from an inventory file or `--set` + `REBRICKABLE_API_KEY`)
+  expanded into several augmented variants each (rotation, colour jitter,
+  blur/downsample, a flatten/posterize pass, background padding — an attempt
+  to narrow the gap between glossy catalog photos and the flatter
+  instruction-icon crops actually scanned, not a guaranteed fix for it).
+  Saves a checkpoint usable via `lpl scan --engine local --embeddings
+  --embedding-weights PATH` — a **drop-in replacement for the existing
+  pretrained-CLIP path** (`embedding.TrainedBackend` implements the exact
+  same `embed_images()` interface as the existing `ClipBackend`; `Gallery`,
+  `build_gallery`, `identify.py`'s ensemble all needed zero changes).
+- **New `[train]` extra**: `torch`, `torchvision`, and `torch-directml` on
+  Windows specifically — confirmed via a real PyPI lookup that
+  `torch-directml` exists and is the right acceleration path for this
+  machine's AMD GPU (no CUDA, ROCm doesn't support Windows well). Nothing
+  installed yet — this extra has never actually been `pip install`ed in this
+  environment, so the real torch-dependent code path (`train/embedding_trainer.py`,
+  `embedding.TrainedBackend`) has **only been exercised via `# pragma: no
+  cover` code review, never actually run**. Same untested-until-installed
+  status `ClipBackend` has always had in this project, just now true for our
+  own trainer too.
+- **Design note**: the triplet-*sampling* logic (which crops pair up as
+  anchor/positive/negative) was deliberately split into its own pure-Python
+  module (`train/sampling.py`, no torch) specifically so it could be
+  unit-tested in this environment where torch isn't installed — 16 new
+  tests, 3 of which (`TrainedBackend` contract tests) are marked
+  `pytest.importorskip("torch")` and currently skip, ready to actually run
+  once torch is installed.
+- **Not yet done**: no real training run has happened. Blocked on getting a
+  `REBRICKABLE_API_KEY` from the user (asked during planning, they agreed to
+  get one) — needed for reliable per-part image URLs at scale; a quick
+  BrickLink-URL-guessing test using `colors.py`'s colour IDs already failed
+  (BrickLink and Rebrickable use different internal colour numbering).
+
 ## Immediate next step
 
-1. **12 residual bag-marker false positives on 76269** (~2% of 644 pages) —
+1. **Get the `REBRICKABLE_API_KEY` from the user** (they agreed to sign up
+   during planning) and `pip install -e ".[train]"`, then run a real
+   end-to-end training pass for the first time ever:
+   ```
+   run train-embedding --inventory-file samples/76307_inventory.csv --out models/lego_embed.pt --epochs 5
+   run scan 6559641.pdf --engine local --embeddings --embedding-weights models/lego_embed.pt --inventory-file samples/76307_inventory.csv --out out
+   ```
+   Compare identification results/confidence against the existing
+   pretrained-CLIP baseline (or against the Brickognize-only baseline from
+   earlier this session, 31/42 parts matched) to see whether the trained
+   model actually helps. This is the first time any of the new training code
+   will have actually executed — expect to find and fix real bugs, the same
+   way every other piece of this project needed real-data debugging before
+   it worked (see every other section of this file).
+2. Once training works on 76307's small 42-part catalog, consider expanding
+   to 76269's much larger catalog (needs the same `REBRICKABLE_API_KEY` to
+   fetch its inventory in the first place — see below).
+3. **12 residual bag-marker false positives on 76269** (~2% of 644 pages) —
    not yet individually diagnosed the way 76307's were; same general
-   "illustration element happens to look digit-shaped" class. Worth another
-   calibration pass if ordinal bag-numbering accuracy on this specific set
-   matters, using the same rigor as this session (crop the real page, measure
-   the real pixel stats, don't guess).
-2. **Get a real inventory for 76269 to actually run `lpl scan`.** Two paths:
-   - Ask the user for a free `REBRICKABLE_API_KEY` (a real account signup —
-     not something this agent should do itself; a few minutes at
-     rebrickable.com/api/). Then: `run scan 6488032.pdf --engine local --set 76269 --out out`.
-   - Or accept a much rougher, unconstrained scan with no inventory at all
-     (`BrickognizeOnlyIdentifier`, lower precision, no closed-set
-     constraint, no count validation) — already the fallback path, no new
-     work needed, just lower accuracy.
-3. If pushing 76307's identification further is wanted: 11/42 parts still
-   unidentified, quantities undercounted — `samples/76307_inventory.csv` plus
-   a fresh run of:
+   "illustration element happens to look digit-shaped" class.
+4. **Get a real inventory for 76269 to actually run `lpl scan`** — needs the
+   same `REBRICKABLE_API_KEY` (5202 parts is too many to browser-scrape).
+   Then: `run scan 6488032.pdf --engine local --set 76269 --out out`.
+5. If pushing 76307's identification further is wanted independent of
+   training: 11/42 parts still unidentified via Brickognize/colour alone,
+   quantities undercounted — `samples/76307_inventory.csv` plus a fresh run
+   of:
    ```
    run scan 6559641.pdf --engine local --inventory-file samples/76307_inventory.csv --out out
    ```
    are the starting point (result isn't committed — regenerate).
-4. Load `out/result.json` into `web/index.html` (drag-drop) and sanity-check
+6. Load `out/result.json` into `web/index.html` (drag-drop) and sanity-check
    a few parts against the physical instructions, for whichever set has a
    fresh scan result.
 
 ## Known open items (not yet started, roughly ranked)
 
+- **No real training run has happened yet.** `lpl train-embedding` and
+  `embedding.TrainedBackend` are implemented and unit-tested at the
+  interface/logic level, but the actual torch training loop has never
+  executed — blocked on `REBRICKABLE_API_KEY` + `pip install -e ".[train]"`.
+  See "Then: user said ... train the model" above.
 - **12/644 pages on 76269 still have bag-marker false positives (~2%).** Not
   yet individually diagnosed — see "Then: tested a real bigger multi-booklet
   set" above.
@@ -388,9 +451,10 @@ first for full session history and current state, then README.md for how the
 tool works.
 
 Short version: it's a LEGO instruction-PDF scanner that maps parts to
-bag/page. Two engines: a paid Claude-vision engine and a free local
-OpenCV+Brickognize engine (`lpl scan --engine local`). 103 tests pass, all
-committed (`c9a8a0c`).
+bag/page. Two engines: a paid Claude-vision engine (user does NOT want this
+used) and a free local OpenCV+Brickognize+embeddings engine
+(`lpl scan --engine local`). 119 tests pass + 3 skip without the `[train]`
+extra, all committed (`9bf6c51`).
 
 Two real sets tested so far. **76307** (Iron Man Mech, 56 pages, single
 unnumbered bag): full detection calibration done (zero bag-marker false
@@ -402,10 +466,22 @@ test): confirmed the classic white-panel style works natively, found and
 fixed a new bag-marker style (circled digits, e.g. "②"/"③"/"⑦" -- one per
 booklet, real structure never seen before), verified all 3 real covers now
 detected correctly. 76269 has ~2% residual bag-marker false positives (not
-yet diagnosed) and no inventory yet (5202 parts is too many to scrape via
-browser -- needs the user to get a free REBRICKABLE_API_KEY).
+yet diagnosed) and no inventory yet (needs a free REBRICKABLE_API_KEY --
+5202 parts is too many to scrape via browser).
 
-Next: see "Immediate next step" in HANDOFF.md -- likely either chasing
-76269's remaining false positives, or getting a REBRICKABLE_API_KEY to
-finally run a full identify pipeline on a big multi-booklet set.
+Then the user said they don't want Claude/Claude-API used, and asked to
+"train the model" -- clarified they meant a real custom part-classifier, not
+just enabling the existing zero-shot CLIP embeddings. Built `lpl
+train-embedding`: fine-tunes a small CNN with triplet-loss metric learning on
+a set's own (augmented) reference images, saved as a checkpoint usable via
+`--embeddings --embedding-weights PATH` -- a drop-in replacement for
+pretrained CLIP, no code changes needed elsewhere. Implemented and unit
+tested at the logic/interface level, but **no real training run has
+happened yet** -- blocked on the user getting a REBRICKABLE_API_KEY (they
+agreed to) and installing the new `[train]` extra (torch + torchvision +
+torch-directml, since this machine has an AMD GPU, no CUDA).
+
+Next: see "Immediate next step" in HANDOFF.md -- top priority is getting the
+REBRICKABLE_API_KEY and running the first-ever real training pass (expect to
+find and fix real bugs, same as everything else in this project).
 ```
